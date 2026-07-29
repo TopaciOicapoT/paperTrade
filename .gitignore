@@ -1,0 +1,12 @@
+# .gitignore para el proyecto de trading
+.env
+*.pyc
+__pycache__/
+models/saved/*.joblib
+models/saved/*.json
+data/cache/
+backtesting/results/*.csv
+backtesting/results/*.html
+.venv/
+venv/
+logs/

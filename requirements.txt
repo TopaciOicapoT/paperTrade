@@ -1,0 +1,27 @@
+# === Conexión con Binance ===
+ccxt>=4.3.0
+
+# === Análisis de datos ===
+pandas>=2.1.0
+numpy>=1.26.0,<2.0.0
+
+# === Indicadores técnicos ===
+ta>=0.11.0
+
+# === Machine Learning ===
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+joblib>=1.3.0
+
+# === Backtesting (ligero, sin dependencias pesadas) ===
+backtesting>=0.3.3
+
+# === Visualización ===
+matplotlib>=3.8.0
+plotly>=5.18.0
+
+# === Utilidades ===
+python-dotenv>=1.0.0
+pyyaml>=6.0
+loguru>=0.7.0
+schedule>=1.2.0

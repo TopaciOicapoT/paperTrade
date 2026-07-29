@@ -1,0 +1,139 @@
+# ============================================================
+# config.yaml — Parámetros del sistema de trading
+# ============================================================
+
+exchange:
+  name: "binance"
+  testnet: true          # false cuando pases a real
+  rate_limit: true
+
+# Pares a operar
+# Clasificación basada en análisis 6 AÑOS futuros 3x con capital $1000:
+#   Aceptados (PF>1.20 Y WR>30% a 6yr CON filtros): ADA, LINK, EGLD, ATOM
+#   Eliminados: BTC(-62%), SOL(-29%), DOT(+2% real), NEAR(-34%), ICP(-25%) — fail 6yr real
+#   Descartados: ETH, BNB, XRP, AVAX, DOGE, MATIC, UNI y otros — PF < 1 a 3 años
+symbols:
+  - "ADA/USDT"    # WR 32.9% (6yr+filtros) | PF 1.35 | $1k→$4,086 | F1+F3
+  - "LINK/USDT"   # WR 31.2% (6yr+filtros) | PF 1.25 | $1k→$2,610 | F2b
+  - "EGLD/USDT"   # WR 38.3% (6yr+filtros) | PF 1.71 | $1k→$3,712 | F2b+F3+F4(RSI)
+  - "ATOM/USDT"   # WR 32.7% (6yr+filtros) | PF 1.34 | $1k→$1,806 | F2b+F3+F1+F4(RSI)
+  # Portfolio €100 capital compartido 6yr: €7,126 (+7,026%) | WR 33.7% | MaxDD -66.3%
+
+# Marcos temporales — estrategia multi-TF
+timeframes:
+  entry: "1m"           # Marco de entrada (vela de trigger)
+  confirm: "5m"         # Confirmación de la rotura
+  hourly: "1h"          # Breakout zones horarias
+  daily: "1d"           # Breakout zones diarias
+  weekly: "1w"          # Breakout zones semanales
+  monthly: "1M"         # Niveles primarios (suelos/techos del mes)
+
+# Estrategia: suelos/techos mensuales + confirmación multi-TF
+levels:
+  # Nivel primario: máx/mín de los últimos N meses
+  monthly_lookback: 6         # Meses hacia atrás para el suelo/techo principal
+  # Zona de proximidad al nivel mensual para empezar a vigilar
+  approach_pct: 0.30          # El precio está "cerca" si está dentro del 0.30% del nivel
+  # Confirmación: breakout anterior en cada TF debe alinearse con la dirección
+  weekly_lookback: 8          # Semanas para buscar rotura semanal histórica
+  daily_lookback: 20          # Días para buscar rotura diaria histórica
+  hourly_lookback: 48         # Horas para buscar rotura horaria histórica
+  # Volumen mínimo para confirmar que otros traders están disparando sus triggers
+  # Análisis de 421 trades: bucket 1.8-2.0x tiene WR 28% (bajo breakeven del 30%)
+  # Bucket >3.0x también es trampa de liquidez (WR 25%). Zona óptima: 2.0-2.5x
+  volume_trigger_ratio: 2.0   # Mínimo — spikes débiles tienen WR bajo breakeven
+  volume_trigger_ratio_max: 3.0  # Global — ver overrides por símbolo en symbol_params
+  # Parámetros para estrategia bounce (reversión a la media)
+  bounce_wick_min_pct: 0.10   # Mecha mínima que debe penetrar el nivel (0.10%)
+  bounce_min_range_pct: 2.0   # Amplitud mínima del rango resistencia-soporte (2%)
+  # Failed retest — filtro anti-fakeout
+  # failed_retest_filter: "auto" → auto-detecta el régimen midiendo los rebotes recientes
+  #   - Si ≥50% de las roturas recientes tuvieron rebote ≥0.15% → activa filtro (fakeout-prone)
+  #   - Si <50% → omite filtro (clean breaker)
+  # Opciones: "auto" | true (siempre ON) | false (siempre OFF)
+  failed_retest_filter: "auto"
+  failed_retest_lookback: 60        # Velas 1m para buscar el patrón una vez detectada la rotura
+  failed_retest_auto_lookback: 500  # Velas 1m para calibrar el régimen del símbolo
+  failed_retest_min_bounce_pct: 0.3 # Usado solo cuando filter=true (override explícito)
+
+# Parámetros por símbolo — sobreescriben los valores globales de [levels]
+# ── Filtros validados (validate_filters.py, 3yr × 3 símbolos) ──────────────────
+# F2b sesión: LINK Europa(08-14h) WR 16.7%→bloqueada (+47.9%); EGLD AM+Noche bloqueada (+34.3%)
+# F3  vol Q3: skip volumen normalizado 2.1-2.7× la media (+16% ADA, +20% EGLD; neutral LINK)
+# F1  momentum: skip momentum 5 velas +0.3..+1.6% → SOLO ADA (+29.1%; LINK/EGLD empeoraría)
+# F4  RSI14>70: analyze_features_v2.py 6yr×4sym → SOLO EGLD+ATOM (ADA/LINK perjudicados)
+#   EGLD: $3,637→$3,712 (+2.0%) | ATOM: $1,585→$1,806 (+13.9%)
+#   ADA:  $4,086→$3,864 (-5.4%) | LINK: $2,610→$2,516 (-3.6%) → no aplicar
+symbol_params:
+  "ADA/USDT":
+    # Momentum Q3: WR zona +0.3%..+1.6% era 21.9% (peor cuartil) — validado +29.1%
+    momentum_q3_block: [0.30, 1.60]
+    # Volumen USDT Q3 [2.1-2.7×]: zona trampa — validado +16.4%
+    usdt_norm_block_range: [2.1, 2.7]
+  "LINK/USDT":
+    failed_retest_filter: false   # Clean breaker — rompe directo sin rebote previo
+    volume_trigger_ratio_max: 2.8 # Bucket 2.8-3.0x WR 21% (trampa de liquidez)
+    # Sesión europea 08-14h UTC: WR 16.7% — bloqueada, validado +47.9%
+    session_block_hours: [8, 14]
+  "EGLD/USDT":
+    volume_trigger_ratio_max: 2.8 # Bucket 2.8-3.0x WR 24% (trampa de liquidez)
+    # América+Noche 14-24h UTC: WR 21-22% — bloqueada, validado +34.3%
+    session_block_hours: [14, 24]
+    # Volumen USDT Q3 [2.1-2.7×]: zona trampa — validado +20.1%
+    usdt_norm_block_range: [2.1, 2.7]
+    # RSI14>70: sobrecompra — bloqueada, validado +2.0% (analyze_features_v2.py)
+    rsi_overbought_block: 70
+  "ATOM/USDT":
+    # find_new_symbols.py 6yr: baseline WR 29.4%/PF 1.14 (+42.2%) → filtros WR 31.5%/PF 1.26
+    # Validado main.py: $1,000→$1,585 (+58.55%) en 6yr (post-hoc vs real: 58.7% vs 58.6% — match!)
+    # Asia 00-08h UTC: WR 20.0% (peor sesión de 4) — bloqueada
+    session_block_hours: [0, 8]
+    usdt_norm_block_range: [2.1, 2.7]
+    momentum_q3_block: [0.30, 1.60]
+    # RSI14>70: sobrecompra — bloqueada, validado +13.9% (analyze_features_v2.py)
+    rsi_overbought_block: 70
+
+# Modelo de IA
+model:
+  probability_threshold: 0.70   # Mínimo score para autorizar entrada
+  retrain_every_days: 7
+  min_training_samples: 400
+
+# Gestión de riesgo — la estrategia busca 1-1.5% rápido
+risk:
+  max_risk_per_trade_pct: 1.0   # Riesgo máximo: 1% del capital
+  take_profit_pct: 3.0          # TP objetivo: 3.0% (mejor R:R probado)
+  tp_min_pct: 3.0               # TP mínimo para salir
+  tp_max_pct: 3.0               # TP máximo
+  sl_behind_level_pct: 1.0      # SL a 1.0% desde el precio de entrada
+  max_open_positions: 1         # 1 posición → 100% del capital por trade
+
+# Capital simulado para paper trading
+paper_trading:
+  initial_balance_usdt: 1000.0
+  fee_pct: 0.1              # Comisión Binance spot por lado (0.1% = taker fee estándar)
+                             # Futuros taker fee: 0.04% — más barato
+
+# Modo de trading: spot o futuros (USDT-M perpetuos)
+futures:
+  enabled: true            # true = simular con apalancamiento; false = spot
+  leverage: 3               # Apalancamiento (recomendado: 3x para empezar, max 5x)
+  # Con leverage=3 y SL=1%: pérdida máxima = 3% del margen (vs 1% en spot)
+  # Liquidación a ~33% de movimiento adverso (muy alejado del SL del 1%)
+  # Fee futuros Binance: 0.04% taker (menor que spot)
+  # Testnet futuros: https://testnet.binancefuture.com (cuenta separada de testnet spot)
+
+# Límites de riesgo operativo
+guardrails:
+  max_daily_loss_pct: 3.0   # Parar si el balance cae >3% en el día
+  max_drawdown_pct: 15.0    # 10% en spot; 15% en futuros 3x (drawdown esperado ~3× el de spot)
+
+# Monitor de noticias/sentimiento (news circuit breaker)
+# Sin API key ni registro — usa Fear & Greed Index (Alternative.me) + RSS de CoinTelegraph/CoinDesk
+news:
+  enabled: true                # Fear & Greed Index + RSS — sin API key, siempre activo
+  check_interval_minutes: 15  # Consultar cada 15 min
+  pause_hours: 4               # Pausar nuevas entradas N horas si se detecta riesgo alto
+  # Riesgo ALTO se activa cuando:
+  #   Fear & Greed Index < 15/100  (terror extremo en el mercado)
+  #   O titulares de noticias acumulan score >= 5 (hack, ban, colapso, aranceles, etc.)

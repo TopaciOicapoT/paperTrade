@@ -1,0 +1,500 @@
+"""
+execution/paper_trader.py
+-------------------------
+Paper trading en tiempo real usando el Testnet de Binance.
+
+CICLO (cada 10 segundos):
+  1. Descargar velas multitemporal (1m, 1h, 1d, 1w)
+  2. Calcular suelos/techos mensuales
+  3. Detectar si el precio rompió el nivel mensual
+  4. Confirmar en semanal + diario + horario (mínimo 2/3)
+  5. Verificar spike de volumen (triggers de otros traders)
+  6. Preguntar al modelo IA si autoriza
+  7. Calcular SL (detrás del nivel) y TP (1-1.5%)
+  8. Registrar la orden en paper
+  9. Monitorear hasta SL o TP
+"""
+
+import json
+import time
+import yaml
+import pandas as pd
+from pathlib import Path
+from loguru import logger
+
+from data.fetcher import get_exchange, get_data_exchange, fetch_multi_timeframe
+from data.news_fetcher import get_news_risk
+from indicators.levels import evaluar_estrategia
+from models.predictor import Predictor
+from risk.manager import RiskManager
+
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.yaml"
+LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+STATE_FILE = Path(__file__).parent.parent / "logs" / "paper_state.json"
+
+logger.add(LOG_DIR / "paper_trading.log", rotation="1 day", retention="30 days")
+
+
+def cargar_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+class PaperTrader:
+    """
+    Motor de paper trading para la estrategia de breakout mensual multi-TF.
+    """
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.exchange = get_exchange(testnet=config["exchange"]["testnet"])  # Para órdenes
+        self.data_exchange = get_data_exchange()  # Para datos OHLCV (siempre real)
+        self.predictor = Predictor(threshold=config["model"]["probability_threshold"])
+        risk_cfg = config["risk"]
+        self.risk_manager = RiskManager(
+            max_risk_pct=risk_cfg["max_risk_per_trade_pct"],
+            tp_pct=risk_cfg["take_profit_pct"],
+            tp_min_pct=risk_cfg["tp_min_pct"],
+            tp_max_pct=risk_cfg["tp_max_pct"],
+            sl_behind_pct=risk_cfg["sl_behind_level_pct"],
+            max_positions=risk_cfg["max_open_positions"],
+        )
+        self.balance_usdt = config["paper_trading"]["initial_balance_usdt"]
+        self.fee_pct = config["paper_trading"].get("fee_pct", 0.1) / 100  # → fracción
+        self.symbols = config["symbols"]
+        self.tf = config["timeframes"]
+
+        # Futuros / apalancamiento
+        futures_cfg = config.get("futures", {})
+        self.futures_enabled = futures_cfg.get("enabled", False)
+        self.leverage        = futures_cfg.get("leverage", 1)
+        if self.futures_enabled:
+            # En futuros, la fee de Binance es menor (taker 0.04%)
+            self.fee_pct = 0.0004
+            logger.info(f"Modo FUTUROS activado | Apalancamiento: {self.leverage}x | Fee: 0.04%")
+
+        guardrails = config.get("guardrails", {})
+        self.max_daily_loss_pct  = guardrails.get("max_daily_loss_pct", 3.0) / 100
+        self.max_drawdown_pct    = guardrails.get("max_drawdown_pct", 10.0) / 100
+
+        self.trade_log: list[dict] = []
+        self.open_orders: dict[str, dict] = {}
+        self._balance_peak: float = self.balance_usdt
+        self._balance_day_open: float = self.balance_usdt
+        self._trading_halted: bool = False
+
+        # News circuit breaker
+        news_cfg = config.get("news", {})
+        self._news_enabled       = news_cfg.get("enabled", False)
+        self._news_pause_hours   = news_cfg.get("pause_hours", 4)
+        self._news_check_interval = news_cfg.get("check_interval_minutes", 15) * 60
+        self._news_paused_until: float = 0.0   # timestamp UNIX
+        self._news_last_check: float = 0.0
+
+        self._cargar_estado()
+
+        logger.info(
+            f"PaperTrader iniciado | "
+            f"Balance: {self.balance_usdt} USDT | "
+            f"Símbolos: {self.symbols}"
+        )
+
+    def _cargar_estado(self):
+        """Recupera balance, posiciones abiertas y log de trades desde disco."""
+        if not STATE_FILE.exists():
+            return
+        try:
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            self.balance_usdt        = state.get("balance_usdt", self.balance_usdt)
+            self.open_orders          = state.get("open_orders", {})
+            self.trade_log            = state.get("trade_log", [])
+            self._balance_peak        = state.get("balance_peak", self.balance_usdt)
+            self._balance_day_open    = state.get("balance_day_open", self.balance_usdt)
+            self._trading_halted      = state.get("trading_halted", False)
+            # Resincronizar posiciones abiertas en el risk manager
+            for symbol in self.open_orders:
+                self.risk_manager.registrar_apertura(symbol)
+            logger.info(
+                f"Estado recuperado desde {STATE_FILE} | "
+                f"Balance: {self.balance_usdt:.2f} USDT | "
+                f"Posiciones abiertas: {list(self.open_orders.keys())}"
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo cargar el estado guardado: {e}")
+
+    def _guardar_estado(self):
+        """Persiste balance, posiciones abiertas y log de trades en disco (escritura atómica)."""
+        state = {
+            "balance_usdt":     self.balance_usdt,
+            "open_orders":      self.open_orders,
+            "trade_log":        self.trade_log,
+            "balance_peak":     self._balance_peak,
+            "balance_day_open": self._balance_day_open,
+            "trading_halted":   self._trading_halted,
+        }
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+        tmp.replace(STATE_FILE)  # operación atómica — nunca deja el archivo a medias
+
+    def _verificar_guardrails(self) -> bool:
+        """
+        Comprueba circuit breaker diario y drawdown máximo.
+        Devuelve True si el trading debe continuar, False si hay que parar.
+        """
+        if self._trading_halted:
+            return False
+
+        # ── Reset diario ──────────────────────────────────────────────────────
+        # Detecta cambio de día UTC y reinicia el balance de referencia diaria
+        hoy = pd.Timestamp.now(tz="UTC").date()
+        if not hasattr(self, "_balance_day_date") or self._balance_day_date != hoy:
+            self._balance_day_date = hoy
+            self._balance_day_open = self.balance_usdt
+
+        # ── Circuit breaker diario ────────────────────────────────────────────
+        daily_loss = (self._balance_day_open - self.balance_usdt) / self._balance_day_open
+        if daily_loss >= self.max_daily_loss_pct:
+            logger.warning(
+                f"CIRCUIT BREAKER — Pérdida diaria {daily_loss:.1%} supera el límite "
+                f"{self.max_daily_loss_pct:.1%}. Trading pausado hasta mañana UTC."
+            )
+            self._trading_halted = True
+            self._guardar_estado()
+            return False
+
+        # ── Max drawdown desde el pico ────────────────────────────────────────
+        if self.balance_usdt > self._balance_peak:
+            self._balance_peak = self.balance_usdt
+
+        drawdown = (self._balance_peak - self.balance_usdt) / self._balance_peak
+        if drawdown >= self.max_drawdown_pct:
+            logger.error(
+                f"MAX DRAWDOWN — Caída {drawdown:.1%} desde el pico "
+                f"({self._balance_peak:.2f} USDT). Trading detenido."
+            )
+            self._trading_halted = True
+            self._guardar_estado()
+            return False
+
+        return True
+
+    def _verificar_noticias(self) -> bool:
+        """
+        Consulta Fear & Greed Index (Alternative.me) + RSS de medios crypto y pausa
+        nuevas entradas si se detecta un evento de alto riesgo macro.
+        Solo hace llamadas reales a la red cada `news_check_interval` segundos.
+
+        Devuelve True si el trading puede continuar, False si hay que pausar.
+        """
+        if not self._news_enabled:
+            return True
+
+        now = time.time()
+
+        # Verificar si la pausa por noticias sigue activa
+        if now < self._news_paused_until:
+            remaining = (self._news_paused_until - now) / 3600
+            logger.info(f"[News] Trading pausado por evento macro — {remaining:.1f}h restantes")
+            return False
+
+        # Respetar el intervalo mínimo entre consultas a la API
+        if now - self._news_last_check < self._news_check_interval:
+            return True
+
+        self._news_last_check = now
+
+        try:
+            report = get_news_risk()
+        except Exception as exc:
+            logger.warning(f"[News] Error en verificación de noticias: {exc} — continuando")
+            return True
+
+        if report.should_pause:
+            self._news_paused_until = now + self._news_pause_hours * 3600
+            logger.warning(
+                f"[News] ⛔ PAUSA activada por riesgo {report.level.upper()} "
+                f"— nuevas entradas suspendidas {self._news_pause_hours}h "
+                f"(score={report.score}, keywords={report.triggered_keywords[:5]})"
+            )
+            return False
+
+        return True
+
+    def _obtener_datos(self, symbol: str) -> dict[str, pd.DataFrame]:
+        """Descarga datos multitemporal para un símbolo desde Binance real."""
+        tfs = [
+            self.tf["entry"],
+            self.tf["hourly"],
+            self.tf["daily"],
+            self.tf["weekly"],
+        ]
+        return fetch_multi_timeframe(
+            symbol=symbol,
+            timeframes=tfs,
+            exchange=self.data_exchange,  # Datos reales siempre
+        )
+
+    def _verificar_ordenes_abiertas(self, symbol: str, data: dict):
+        """Verifica si alguna orden abierta alcanzó su SL o TP."""
+        if symbol not in self.open_orders:
+            return
+
+        order = self.open_orders[symbol]
+        df_entry = data[self.tf["entry"]]
+        current_high = float(df_entry["high"].iloc[-1])
+        current_low = float(df_entry["low"].iloc[-1])
+
+        hit_tp = hit_sl = False
+
+        if order["direction"] == "long":
+            hit_tp = current_high >= order["take_profit"]
+            hit_sl = current_low <= order["stop_loss"]
+        else:
+            hit_tp = current_low <= order["take_profit"]
+            hit_sl = current_high >= order["stop_loss"]
+
+        if hit_tp or hit_sl:
+            exit_type = "TP" if hit_tp else "SL"
+            exit_price = order["take_profit"] if hit_tp else order["stop_loss"]
+
+            pnl = (exit_price - order["entry_price"]) / order["entry_price"]
+            if order["direction"] == "short":
+                pnl = -pnl
+
+            # Aplicar apalancamiento (en spot leverage=1, en futuros leverage=N)
+            pnl *= self.leverage
+
+            pnl_usdt = order["risk_usdt"] * (order["tp_pct"] / order["sl_pct"] if hit_tp else -1)
+            pnl_usdt *= self.leverage
+
+            # Comisión de apertura + cierre (ambos lados del trade)
+            fee_usdt = order["entry_price"] * order["quantity"] * self.fee_pct * 2
+            pnl_usdt -= fee_usdt
+
+            self.balance_usdt += pnl_usdt
+
+            log_entry = {
+                **order,
+                "exit_price": exit_price,
+                "exit_type": exit_type,
+                "pnl_pct": round(pnl * 100, 4),
+                "pnl_usdt": round(pnl_usdt, 2),
+                "fee_usdt": round(fee_usdt, 4),
+                "balance_after": round(self.balance_usdt, 2),
+            }
+            self.trade_log.append(log_entry)
+
+            logger.info(
+                f"[{exit_type}] {symbol} {order['direction'].upper()} cerrado | "
+                f"PnL: {pnl_usdt:+.2f} USDT ({pnl*100:+.2f}%) | "
+                f"Balance: {self.balance_usdt:.2f} USDT"
+            )
+
+            del self.open_orders[symbol]
+            self.risk_manager.registrar_cierre(symbol)
+            self._guardar_estado()
+
+    def _procesar_simbolo(self, symbol: str):
+        """Ciclo completo de análisis y decisión para un símbolo."""
+        try:
+            data = self._obtener_datos(symbol)
+
+            df_entry = data[self.tf["entry"]]
+            df_horario = data[self.tf["hourly"]]
+            df_diario = data[self.tf["daily"]]
+            df_semanal = data[self.tf["weekly"]]
+
+            # 1. Verificar órdenes abiertas
+            self._verificar_ordenes_abiertas(symbol, data)
+
+            # 2. Solo buscar nuevas entradas si hay capacidad
+            if not self.risk_manager.puede_abrir_posicion(symbol):
+                return
+
+            # 2b. Verificar news circuit breaker (solo bloquea nuevas entradas)
+            if not self._verificar_noticias():
+                return
+
+            # 3. Evaluar la estrategia completa (niveles mensuales + multi-TF + volumen)
+            signal = evaluar_estrategia(
+                symbol=symbol,
+                df_entry=df_entry,
+                df_horario=df_horario,
+                df_diario=df_diario,
+                df_semanal=df_semanal,
+                config=self.config,
+            )
+
+            if signal is None or not signal.es_valida:
+                return
+
+            # En spot no se puede operar en corto — solo futuros permite SHORTs
+            if signal.direction == "short" and not self.futures_enabled:
+                logger.debug(f"[Spot] Señal SHORT ignorada en {symbol} — requiere futuros")
+                return
+
+            # ── Filtros de calidad de entrada (validados en validate_filters.py) ────────
+            sym_params = self.config.get("symbol_params", {}).get(symbol, {})
+
+            # F2b: Filtro de sesión por símbolo (hora UTC)
+            session_block = sym_params.get("session_block_hours")
+            if session_block:
+                lo_h, hi_h = session_block
+                now_hour = pd.Timestamp.now(tz="UTC").hour
+                if lo_h <= now_hour < hi_h:
+                    logger.debug(
+                        f"[SesiónBlock] {symbol} — hora {now_hour}h UTC dentro "
+                        f"de zona bloqueada ({lo_h}-{hi_h}h)"
+                    )
+                    return
+
+            # F3: Filtro de volumen USDT normalizado (zona trampa 2.1-2.7× la media)
+            usdt_block = sym_params.get("usdt_norm_block_range")
+            if usdt_block:
+                lo_v, hi_v = usdt_block
+                last_vol  = float(df_entry["volume"].iloc[-1]) * float(df_entry["close"].iloc[-1])
+                mean_vol  = (df_entry["volume"] * df_entry["close"]).iloc[-50:].mean()
+                usdt_norm = last_vol / mean_vol if mean_vol > 0 else 1.0
+                if lo_v <= usdt_norm <= hi_v:
+                    logger.debug(
+                        f"[VolBlock] {symbol} — vol norm {usdt_norm:.2f}× en zona trampa "
+                        f"({lo_v}-{hi_v}×)"
+                    )
+                    return
+
+            # F1: Filtro de momentum 5 velas (zona trampa Q3, solo ADA)
+            mom_block = sym_params.get("momentum_q3_block")
+            if mom_block and len(df_entry) >= 6:
+                lo_m, hi_m = mom_block
+                prev5      = float(df_entry["close"].iloc[-6])
+                curr_close = float(df_entry["close"].iloc[-1])
+                momentum_5 = (curr_close - prev5) / prev5 * 100
+                if lo_m <= momentum_5 <= hi_m:
+                    logger.debug(
+                        f"[MomBlock] {symbol} — momentum {momentum_5:.2f}% en zona trampa "
+                        f"({lo_m}-{hi_m}%)"
+                    )
+                    return
+
+            # F4: Filtro RSI14 sobrecompra (RSI≥70 → WR 25.9%, bloquear)
+            import numpy as _np
+            rsi_block = sym_params.get("rsi_overbought_block",
+                                       self.config.get("rsi_overbought_block"))
+            if rsi_block is not None and len(df_entry) >= 14:
+                closes14 = df_entry["close"].iloc[-14:].astype(float).values
+                deltas = _np.diff(closes14)
+                avg_gain = _np.where(deltas > 0, deltas, 0.0).mean()
+                avg_loss = _np.where(deltas < 0, -deltas, 0.0).mean()
+                rsi14 = (100.0 - 100.0 / (1.0 + avg_gain / avg_loss)) if avg_loss > 0 else 100.0
+                if rsi14 >= rsi_block:
+                    logger.debug(
+                        f"[RSIBlock] {symbol} — RSI14 {rsi14:.1f} ≥ {rsi_block} (sobrecompra)"
+                    )
+                    return
+
+            # 4. Filtro IA (capa adicional de validación)
+            autorizado, prob = self.predictor.autorizar_entrada(df_entry)
+            if not autorizado:
+                return
+
+            # 5. Calcular parámetros de riesgo
+            orden = self.risk_manager.calcular_orden(
+                symbol=symbol,
+                direction=signal.direction,
+                entry_price=signal.entry_price,
+                monthly_level=signal.monthly_level,
+                balance_usdt=self.balance_usdt,
+                volume_ratio=signal.volume_ratio,
+            )
+
+            if orden is None:
+                return
+
+            # ── Verificación de liquidación (futuros) ──
+            # La liquidación ocurre cuando el movimiento adverso ≈ 1/leverage
+            # El SL DEBE estar siempre antes del precio de liquidación.
+            if self.futures_enabled and self.leverage > 1:
+                margin_rate = 1 / self.leverage
+                if orden.direction == "long":
+                    liq_price = orden.entry_price * (1 - margin_rate * 0.9)
+                    safe = orden.stop_loss > liq_price
+                else:
+                    liq_price = orden.entry_price * (1 + margin_rate * 0.9)
+                    safe = orden.stop_loss < liq_price
+                if not safe:
+                    logger.warning(
+                        f"[Futuros] SL peligroso en {symbol}: "
+                        f"SL={orden.stop_loss:.4f} está más allá del precio de liquidación "
+                        f"{liq_price:.4f} con {self.leverage}x — trade cancelado"
+                    )
+                    return
+                logger.debug(
+                    f"[Futuros] Liquidación en {liq_price:.4f} | "
+                    f"SL en {orden.stop_loss:.4f} — margen seguro OK"
+                )
+
+            # 6. Registrar la orden (paper)
+            order_record = {
+                "symbol": symbol,
+                "direction": orden.direction,
+                "entry_price": orden.entry_price,
+                "stop_loss": orden.stop_loss,
+                "take_profit": orden.take_profit,
+                "quantity": orden.quantity,
+                "risk_usdt": orden.risk_usdt,
+                "reward_usdt": orden.reward_usdt,
+                "tp_pct": orden.tp_pct,
+                "sl_pct": orden.sl_pct,
+                "leverage": self.leverage,
+                "futures": self.futures_enabled,
+                "ai_probability": round(prob, 4),
+                "monthly_level": signal.monthly_level,
+                "volume_ratio": signal.volume_ratio,
+                "confirmations": signal.confirmations,
+                "confirmation_score": signal.confirmation_score,
+                "entry_time": pd.Timestamp.now(tz="UTC").isoformat(),
+            }
+
+            self.open_orders[symbol] = order_record
+            self.risk_manager.registrar_apertura(symbol)
+            self._guardar_estado()
+            logger.success(f"Orden PAPER abierta: {orden.resumen()}")
+
+        except Exception as e:
+            logger.error(f"Error inesperado procesando {symbol}: {e}", exc_info=True)
+
+    def ejecutar(self, interval_seconds: int = 10):
+        """
+        Inicia el loop principal del paper trader.
+
+        Args:
+            interval_seconds: Segundos entre cada ciclo (default 10s)
+                             La vela de 1m cierra cada 60s, pero ciclos más cortos
+                             permiten detectar hits de SL/TP más rápido.
+        """
+        logger.info(f"Iniciando paper trader | Ciclo: cada {interval_seconds}s")
+
+        while True:
+            if not self._verificar_guardrails():
+                logger.info("Trading pausado por guardrail. Esperando siguiente ciclo...")
+                time.sleep(interval_seconds)
+                continue
+
+            for symbol in self.symbols:
+                self._procesar_simbolo(symbol)
+
+            wins = sum(1 for t in self.trade_log if t.get("exit_type") == "TP")
+            losses = sum(1 for t in self.trade_log if t.get("exit_type") == "SL")
+
+            news_status = "🔕 paused" if time.time() < self._news_paused_until else ("enabled" if self._news_enabled else "disabled")
+            mode = f"futures {self.leverage}x" if self.futures_enabled else "spot"
+            logger.info(
+                f"Balance: {self.balance_usdt:.2f} USDT | "
+                f"Modo: {mode} | "
+                f"Abiertas: {self.risk_manager.posiciones_abiertas} | "
+                f"Wins/Losses: {wins}/{losses} | "
+                f"News: {news_status}"
+            )
+
+            time.sleep(interval_seconds)
