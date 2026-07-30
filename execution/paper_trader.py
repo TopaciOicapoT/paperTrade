@@ -83,6 +83,7 @@ class PaperTrader:
         self._balance_peak: float = self.balance_usdt
         self._balance_day_open: float = self.balance_usdt
         self._trading_halted: bool = False
+        self._stop_requested: bool = False  # señal de parada limpia desde la API
 
         # News circuit breaker
         news_cfg = config.get("news", {})
@@ -464,6 +465,105 @@ class PaperTrader:
         except Exception as e:
             logger.error(f"Error inesperado procesando {symbol}: {e}", exc_info=True)
 
+    # ── API de control (usada por el dashboard web) ──────────────────────────
+
+    def get_snapshot(self) -> dict:
+        """Devuelve el estado completo del bot para la API REST / WebSocket."""
+        wins   = sum(1 for t in self.trade_log if t.get("exit_type") == "TP")
+        losses = sum(1 for t in self.trade_log if t.get("exit_type") == "SL")
+        manual = sum(1 for t in self.trade_log if t.get("exit_type") == "MANUAL")
+        total  = wins + losses + manual
+        initial = self.config["paper_trading"]["initial_balance_usdt"]
+        drawdown = (
+            (self._balance_peak - self.balance_usdt) / self._balance_peak * 100
+            if self._balance_peak > 0 else 0.0
+        )
+        return {
+            "balance_usdt":    round(self.balance_usdt, 2),
+            "balance_peak":    round(self._balance_peak, 2),
+            "initial_balance": initial,
+            "pnl_usdt":        round(self.balance_usdt - initial, 2),
+            "pnl_pct":         round((self.balance_usdt - initial) / initial * 100, 2),
+            "drawdown_pct":    round(drawdown, 2),
+            "trading_halted":  self._trading_halted,
+            "stop_requested":  self._stop_requested,
+            "news_paused":     time.time() < self._news_paused_until,
+            "news_paused_until": self._news_paused_until if time.time() < self._news_paused_until else None,
+            "open_positions":  len(self.open_orders),
+            "total_trades":    total,
+            "wins":            wins,
+            "losses":          losses,
+            "manual_closes":   manual,
+            "win_rate":        round(wins / total * 100, 1) if total > 0 else 0.0,
+            "leverage":        self.leverage,
+            "futures_enabled": self.futures_enabled,
+            "mode":            f"futures {self.leverage}x" if self.futures_enabled else "spot",
+            "symbols":         self.symbols,
+            "open_orders":     self.open_orders,
+        }
+
+    def cerrar_posicion_manual(self, symbol: str) -> dict | None:
+        """Cierra una posición abierta a precio de mercado actual. Devuelve el log entry."""
+        if symbol not in self.open_orders:
+            return None
+        try:
+            ticker = self.data_exchange.fetch_ticker(symbol)
+            current_price = float(ticker["last"])
+        except Exception as e:
+            logger.error(f"[ManualClose] No se pudo obtener precio de {symbol}: {e}")
+            return None
+
+        order = self.open_orders[symbol]
+        gross_pnl = order["quantity"] * (current_price - order["entry_price"])
+        if order["direction"] == "short":
+            gross_pnl = -gross_pnl
+        gross_pnl *= self.leverage
+        fee_usdt = order["entry_price"] * order["quantity"] * self.fee_pct * 2
+        pnl_usdt = gross_pnl - fee_usdt
+        pnl_pct  = (current_price - order["entry_price"]) / order["entry_price"]
+        if order["direction"] == "short":
+            pnl_pct = -pnl_pct
+        pnl_pct *= self.leverage
+
+        self.balance_usdt += pnl_usdt
+
+        log_entry = {
+            **order,
+            "exit_price":    current_price,
+            "exit_type":     "MANUAL",
+            "pnl_pct":       round(pnl_pct * 100, 4),
+            "pnl_usdt":      round(pnl_usdt, 2),
+            "fee_usdt":      round(fee_usdt, 4),
+            "balance_after": round(self.balance_usdt, 2),
+        }
+        self.trade_log.append(log_entry)
+        del self.open_orders[symbol]
+        self.risk_manager.registrar_cierre(symbol)
+        self._guardar_estado()
+        logger.warning(
+            f"[MANUAL] {symbol} cerrado manualmente | "
+            f"PnL: {pnl_usdt:+.2f} USDT | Balance: {self.balance_usdt:.2f} USDT"
+        )
+        return log_entry
+
+    def cerrar_todo_y_parar(self) -> list[dict]:
+        """Cierra todas las posiciones abiertas y activa el halt. Botón de emergencia."""
+        closed = []
+        for symbol in list(self.open_orders.keys()):
+            result = self.cerrar_posicion_manual(symbol)
+            if result:
+                closed.append(result)
+        self._trading_halted = True
+        self._guardar_estado()
+        logger.error(f"[EMERGENCY] Todas las posiciones cerradas y trading detenido.")
+        return closed
+
+    def reanudar(self):
+        """Reactiva el trading tras un halt manual o de guardrails."""
+        self._trading_halted = False
+        self._guardar_estado()
+        logger.info("[API] Trading reanudado manualmente.")
+
     def ejecutar(self, interval_seconds: int = 10):
         """
         Inicia el loop principal del paper trader.
@@ -475,7 +575,7 @@ class PaperTrader:
         """
         logger.info(f"Iniciando paper trader | Ciclo: cada {interval_seconds}s")
 
-        while True:
+        while not self._stop_requested:
             if not self._verificar_guardrails():
                 logger.info("Trading pausado por guardrail. Esperando siguiente ciclo...")
                 time.sleep(interval_seconds)

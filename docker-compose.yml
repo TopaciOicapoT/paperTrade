@@ -1,0 +1,41 @@
+services:
+  # ── Base de datos ─────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: papertrade-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: papertrade
+      POSTGRES_USER: papertrade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # expuesto solo para desarrollo; quitar en producción
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U papertrade"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Bot + API FastAPI ─────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: papertrade-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://papertrade:${POSTGRES_PASSWORD:-changeme}@db:5432/papertrade
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs # estado persistido + logs en el host
+      - ./models/saved:/app/models/saved # modelo ML persistido en el host
+      - ./config:/app/config # config editable sin rebuild
+
+volumes:
+  postgres_data:

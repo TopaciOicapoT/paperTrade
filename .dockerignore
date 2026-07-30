@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+data/cache/
+models/saved/*.joblib
+models/saved/scaler.joblib
+backtesting/results/
+frontend/node_modules/
+frontend/.env.local
+.git/

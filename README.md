@@ -12,12 +12,16 @@ Bot de breakout de niveles mensuales para criptomonedas. Detecta cuando el preci
 - **Resiliencia**: estado persistido en disco, auto-reinicio ante crashes, circuit breaker diario
 - **News circuit breaker**: pausa automática ante eventos macro sin API key (Fear & Greed + RSS)
 - **Futuros**: soporte para USDT-M perpetuos con leverage configurable (default 3x)
+- **Dashboard web**: API REST + WebSocket (FastAPI) + frontend Vue 3 — control total desde el navegador
+- **Deploy en servidor**: Docker Compose con PostgreSQL para alojar en cualquier VPS
 
 ---
 
 ## Requisitos
 
 - Python 3.11+
+- Node.js 20+ (solo para desarrollo del frontend)
+- Docker + Docker Compose (para deploy en servidor)
 - Cuenta en [Binance Testnet](https://testnet.binance.vision/) para el paper trader
 
 ---
@@ -44,11 +48,12 @@ pip install -r requirements.txt --index-url https://pypi.org/simple/
 Copy-Item .env.example .env
 ```
 
-Editar `.env` con las API keys de Binance Testnet:
+Editar `.env` con las API keys de Binance Testnet y la contraseña de PostgreSQL:
 
 ```
 BINANCE_API_KEY=tu_api_key_testnet_aqui
 BINANCE_SECRET_KEY=tu_secret_key_testnet_aqui
+POSTGRES_PASSWORD=elige_una_contrasena_segura
 ```
 
 > Las API keys de testnet spot se obtienen en https://testnet.binance.vision/ (login con GitHub)
@@ -160,7 +165,7 @@ Segunda estrategia — detecta rebotes en el nivel mensual cuando el precio lo t
 
 El modelo se guarda en `models/saved/xgb_breakout.joblib`. **Reentrenar cada semana** mientras el paper trader acumula trades reales — el modelo mejora con cada ciclo.
 
-### Paper trader
+### Paper trader (modo consola — sin dashboard)
 
 Opera en tiempo real contra Binance Testnet. Requiere las API keys en `.env`.
 
@@ -174,7 +179,7 @@ powershell -ExecutionPolicy Bypass -File .\start_bot.ps1
 - Logs en tiempo real: `logs/paper_trading.log`
 - Estado persistido: `logs/paper_state.json` (balance + posiciones abiertas)
 
-**Ver estado en tiempo real:**
+**Ver estado en tiempo real (consola):**
 
 ```powershell
 # Últimas líneas del log
@@ -194,6 +199,47 @@ paper trader corre → acumula trades → reentrenar cada semana → mejor model
 # Reentrenar después de una semana
 .\.venv\Scripts\python.exe main.py train
 ```
+
+### Dashboard web (API + frontend Vue 3)
+
+Arranca el bot integrado en el servidor web. Sustituye a `start_bot.ps1` cuando se usa el dashboard.
+
+**Desarrollo local (2 terminales):**
+
+```powershell
+# Terminal 1 — API FastAPI + bot en background
+.\.venv\Scripts\uvicorn.exe api.main:app --reload --host 0.0.0.0 --port 8000
+
+# Terminal 2 — frontend Vue 3 con hot-reload
+cd frontend
+npm install --registry https://registry.npmjs.org
+npm run dev
+# → http://localhost:5173
+```
+
+**Deploy en servidor con Docker:**
+
+```bash
+# Construir imágenes y levantar todos los servicios
+docker compose up --build -d
+# → http://tu-servidor:8000
+```
+
+El Dockerfile hace el build de Vue y FastAPI sirve el `frontend/dist/` en `/`. Solo se expone el puerto 8000.
+
+**Endpoints de la API REST:**
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| GET | `/api/state` | Estado completo del bot (balance, PnL, drawdown, WR) |
+| GET | `/api/positions` | Posiciones abiertas actuales |
+| POST | `/api/positions/{symbol}/close` | Cerrar una posición a precio de mercado |
+| POST | `/api/emergency` | Cerrar todo + detener el bot |
+| POST | `/api/resume` | Reanudar trading tras halt |
+| GET | `/api/history` | Historial de trades paginado |
+| GET | `/api/history/stats` | WR, PF, PnL total, mejor/peor trade |
+| WS | `/ws` | WebSocket — push de estado cada 5 segundos |
+| GET | `/docs` | Documentación OpenAPI interactiva |
 
 ---
 
@@ -274,14 +320,18 @@ El bot está diseñado para sobrevivir reinicios y caídas:
 
 | Mecanismo | Descripción |
 |-----------|-------------|
-| `start_bot.ps1` | Wrapper que reinicia el proceso automáticamente si cae por error |
+| `start_bot.ps1` | Wrapper que reinicia el proceso automáticamente si cae por error (modo consola) |
+| `docker compose restart: unless-stopped` | Docker reinicia el contenedor automáticamente si cae (modo servidor) |
 | Startup de Windows | Acceso directo en la carpeta Startup — arranca al iniciar sesión |
 | `logs/paper_state.json` | Balance + posiciones abiertas guardados tras cada trade (escritura atómica) |
+| PostgreSQL | Historial de trades persistido en DB — no se pierde aunque el contenedor se reinicie |
+| `logs/` como volumen Docker | Los logs y el estado JSON sobreviven reinicios del contenedor |
 | Retry con backoff | Reintentos automáticos (5s → 15s → 30s) ante errores de red con Binance |
 | Error boundary | Excepciones en un símbolo no matan el loop — se loguean y continúa |
 | Circuit breaker diario | Para el trading si la pérdida diaria supera el umbral configurado |
 | News circuit breaker | Pausa nuevas entradas N horas si Fear & Greed < 15 o RSS score ≥ 5 (sin API key) |
 | Liquidation guard | En modo futuros, cancela el trade si el SL está más allá del precio de liquidación |
+| WebSocket reconexión | El frontend se reconecta automáticamente cada 3s si pierde la conexión |
 
 ---
 
@@ -289,8 +339,32 @@ El bot está diseñado para sobrevivir reinicios y caídas:
 
 ```
 autoTrading/
-├── main.py                     # Punto de entrada — todos los comandos
-├── start_bot.ps1               # Wrapper con auto-reinicio
+├── main.py                     # Punto de entrada — comandos CLI (backtest, train, levels)
+├── start_bot.ps1               # Wrapper con auto-reinicio (modo consola sin dashboard)
+├── Dockerfile                  # Imagen multi-stage: build Vue → Python API
+├── docker-compose.yml          # Orquestación: api + PostgreSQL
+├── api/
+│   ├── main.py                 # FastAPI app — arranca bot en thread de fondo
+│   ├── bot_runner.py           # Wrapper thread para PaperTrader
+│   ├── schemas.py              # Modelos Pydantic de request/response
+│   ├── db/
+│   │   ├── database.py         # SQLAlchemy engine (PostgreSQL / SQLite fallback)
+│   │   └── models.py           # Tabla trades en DB
+│   └── routers/
+│       ├── bot.py              # /api/state, /api/emergency, /api/resume, WS /ws
+│       └── trades.py           # /api/positions, /api/history, /api/history/stats
+├── frontend/
+│   ├── package.json            # Vue 3 + Vite
+│   ├── vite.config.js          # Proxy /api y /ws → :8000 en dev
+│   └── src/
+│       ├── App.vue             # Layout principal
+│       ├── style.css           # Tema oscuro trading
+│       ├── composables/
+│       │   └── useBot.js       # WebSocket reactivo + helpers REST
+│       └── components/
+│           ├── BotStatus.vue   # Cards: Balance · PnL · Drawdown · Win Rate
+│           ├── OpenPositions.vue  # Tabla posiciones + cerrar individual + EMERGENCY STOP
+│           └── TradeHistory.vue   # Historial paginado con estadísticas
 ├── config/
 │   └── config.yaml             # Parámetros de la estrategia
 ├── backtesting/
@@ -313,7 +387,7 @@ autoTrading/
 ├── logs/
 │   ├── paper_trading.log       # Log en tiempo real
 │   └── paper_state.json        # Estado persistido (balance + posiciones abiertas)
-├── .env                        # API keys (NO subir a Git)
+├── .env                        # API keys + POSTGRES_PASSWORD (NO subir a Git)
 └── .env.example                # Plantilla de credenciales
 ```
 
@@ -408,7 +482,18 @@ Si <50%:
 - [x] **Historial de rechazos** (no añadir): ICP, NEAR, BTC, SOL, DOT, XLM, ALGO, VET, FIL, HBAR, INJ
 - [x] Criterio fijo: WR ≥ 32% Y PF ≥ 1.25 en backtest real `main.py` con filtros
 
-### ⏳ Fase 4 — Paper trading en vivo (iniciada: 2026-07-29)
+### ✅ Fase 4a — Dashboard web (completada: 2026-07-30)
+- [x] API REST + WebSocket con FastAPI — bot corre en thread de fondo
+- [x] Frontend Vue 3 + Vite — tema oscuro, diseño de trading
+- [x] Cards en tiempo real: Balance, PnL, Drawdown, Win Rate
+- [x] Tabla de posiciones abiertas con cierre manual por símbolo
+- [x] Botón EMERGENCY STOP — cierra todo y detiene el bot
+- [x] Botón Reanudar trading tras halt manual o de guardrails
+- [x] Historial de trades paginado con WR, PF, mejor/peor trade
+- [x] PostgreSQL vía Docker Compose para persistencia en servidor
+- [x] Dockerfile multi-stage (Vue build + Python) — deploy en un solo contenedor
+
+### ⏳ Fase 4b — Paper trading en vivo (iniciada: 2026-07-29)
 - [x] Paper trader arrancado en Binance Testnet — 4 símbolos, 4 filtros activos
 - [x] Ciclo 60s, futuros 3x, balance 1000 USDT inicial
 - [ ] Acumular ≥ 50 trades con WR cercana al backtest (32-38%)
@@ -416,7 +501,7 @@ Si <50%:
 - [ ] Validar que los filtros per-símbolo se comportan igual en tiempo real
 - [ ] Verificar ausencia de bugs de ejecución durante al menos 4 semanas
 
-### 🔜 Fase 5 — Migración a exchange real (pendiente)
+### 🔜 Fase 5 — Migración a exchange real (pendiente, antes de real)
 
 > Binance no permite futuros en ciertas regiones. La solución es **Bybit** vía CCXT.
 > Los datos de mercado (OHLCV, volumen) seguirán viniendo de Binance — solo cambia el canal de ejecución.
@@ -433,9 +518,18 @@ Si <50%:
 
 **Cambios de código estimados:** ~20 líneas en `fetcher.py` + sección `config.yaml`. El resto del bot es agnóstico al exchange.
 
-### 🔜 Fase 6 — Mejoras futuras (ideas)
+### 🔜 Fase 6 — Deploy en servidor (pendiente)
+- [ ] Contratar VPS (DigitalOcean / Hetzner / Contabo — mínimo 1 vCPU, 1 GB RAM)
+- [ ] Instalar Docker + Docker Compose en el servidor
+- [ ] Configurar `.env` con las API keys y `POSTGRES_PASSWORD` seguro
+- [ ] `docker compose up --build -d` — levanta todo
+- [ ] Configurar dominio + Nginx como reverse proxy (opcional, para HTTPS)
+- [ ] Monitorizar con `docker compose logs -f api`
+
+### 🔜 Fase 7 — Mejoras futuras (ideas)
 - [ ] Filtro de tendencia: solo LONGs cuando SMA50 semanal alcista (SHORTs tienen WR 34.7% vs LONGs 30.0%)
 - [ ] Simular slippage en backtest (~0.05% adicional por entrada)
 - [ ] Validar tamaño mínimo de orden por exchange
 - [ ] Sincronizar balance real al arrancar desde el exchange
-- [ ] Dashboard web ligero para monitorizar trades en tiempo real
+- [ ] Curva de equity en el dashboard (gráfico de balance histórico)
+- [ ] Autenticación básica en el dashboard (usuario + contraseña)
