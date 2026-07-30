@@ -178,6 +178,7 @@ def cmd_analyze(args, config: dict):
             ml_threshold=config["model"]["probability_threshold"] if args.ml else 0.0,
             volatility_filter=getattr(args, "vol_filter", False),
             leverage=getattr(args, "leverage", 1),
+            trend_filter=getattr(args, "trend_filter", False),
         )
         imprimir_resumen(result)
         analizar_fallos(result)
@@ -357,6 +358,8 @@ if __name__ == "__main__":
                       help="Desactiva el filtro failed retest (muestra baseline sin el filtro)")
     p_bt.add_argument("--compare", action="store_true",
                       help="Compara CON y SIN filtro failed retest en paralelo")
+    p_bt.add_argument("--trend-filter", action="store_true",
+                      help="Solo LONGs en tendencia alcista (SMA50w>SMA200w) y SHORTs en bajista")
 
     # analyze
     p_an = subparsers.add_parser("analyze", help="Analiza patrones de fallos en la estrategia")

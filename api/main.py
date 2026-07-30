@@ -20,6 +20,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Receive, Scope, Send
 from loguru import logger
 
 from api.bot_runner import BotRunner
@@ -108,5 +109,12 @@ app.include_router(bot.router)
 app.include_router(trades.router)
 
 # Servir el build de React si ya existe (producción)
+# StaticFiles solo maneja HTTP — ignorar silenciosamente WebSocket upgrades
+class _HTTPOnlyStaticFiles(StaticFiles):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return
+        await super().__call__(scope, receive, send)
+
 if FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+    app.mount("/", _HTTPOnlyStaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

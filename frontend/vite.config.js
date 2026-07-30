@@ -5,8 +5,8 @@ export default defineConfig({
     plugins: [vue()],
     server: {
         proxy: {
-            '/api': { target: 'http://localhost:8000', changeOrigin: true },
-            '/ws': { target: 'ws://localhost:8000', ws: true }
+            // ws: true permite proxear también WebSocket upgrades en /api/*
+            '/api': { target: 'http://localhost:8000', changeOrigin: true, ws: true }
         }
     }
 })

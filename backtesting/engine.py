@@ -79,6 +79,7 @@ def simular_trades(
     failed_retest_filter: bool = True,  # False = desactiva filtro para comparar baseline
     symbol_params: dict | None = None,  # Overrides por símbolo desde config["symbol_params"]
     rsi_overbought_block: float | None = None,  # Bloquea entradas con RSI14 ≥ umbral (ej. 70)
+    trend_filter: bool = False,  # Solo LONGs en tendencia alcista (SMA50w > SMA200w) y viceversa
 ) -> BacktestResult:
     """
     Simula la estrategia de breakout mensual sobre datos históricos.
@@ -158,6 +159,20 @@ def simular_trades(
     logger.enable("indicators.levels")
     logger.info(f"Niveles pre-calculados para {len(daily_levels_cache)} días")
 
+    # ── Pre-calcular tendencia semanal (SMA50 vs SMA200) ──
+    # True = alcista (SMA50 > SMA200), False = bajista, NaN = sin datos suficientes
+    # Usamos .asof() en el bucle para obtener el valor vigente en cada vela 5m.
+    trend_series: pd.Series | None = None
+    if trend_filter and df_weekly is not None and len(df_weekly) >= 50:
+        sma50  = df_weekly["close"].rolling(50).mean()
+        sma200 = df_weekly["close"].rolling(200).mean()
+        trend_series = (sma50 > sma200)   # True = tendencia alcista semanal
+        n_bull = trend_series.sum()
+        logger.info(
+            f"[TrendFilter] SMA50w > SMA200w en {n_bull}/{len(trend_series)} semanas "
+            f"({n_bull/len(trend_series)*100:.0f}% alcista)"
+        )
+
     # ── Pre-calcular días de alta volatilidad (proxy de noticias) ──
     # Un día es "caliente" si su rango (high-low)/low supera la media + N*std
     # de los últimos `volatility_window` días. En esos días el news circuit breaker
@@ -233,6 +248,18 @@ def simular_trades(
             continue
 
         direction = "long" if monthly.broke_resistance else "short"
+
+        # ── Filtro de tendencia semanal (SMA50w vs SMA200w) ──
+        # LONGs solo en mercado alcista; SHORTs solo en bajista.
+        # Evita operar en contra de la tendencia macro (ej. LONGs en bear 2018-2020).
+        if trend_series is not None:
+            trend_val = trend_series.asof(df_entry.index[i])
+            if pd.isna(trend_val):
+                continue
+            if direction == "long"  and not trend_val:
+                continue   # bajista — no entrar largo
+            if direction == "short" and trend_val:
+                continue   # alcista — no entrar corto
 
         # En spot no se puede operar en corto (sin margen/préstamo).
         # Solo futuros (leverage > 1) puede tomar SHORTs.

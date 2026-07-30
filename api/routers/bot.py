@@ -80,7 +80,7 @@ def ws_clients():
 
 
 @router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, request: Request):
+async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     trader = websocket.app.state.trader
     try:

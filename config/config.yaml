@@ -106,7 +106,7 @@ risk:
   tp_min_pct: 3.0               # TP mínimo para salir
   tp_max_pct: 3.0               # TP máximo
   sl_behind_level_pct: 1.0      # SL a 1.0% desde el precio de entrada
-  max_open_positions: 1         # 1 posición → 100% del capital por trade
+  max_open_positions: 3         # 3 posiciones → 33.33% del capital por trade
 
 # Capital simulado para paper trading
 paper_trading:

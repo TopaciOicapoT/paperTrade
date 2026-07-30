@@ -118,6 +118,7 @@ Todos los comandos se ejecutan desde la raíz del proyecto con el entorno activa
 | `--capital` | `1000` | Capital inicial en $ para mostrar curva de equity trade a trade |
 | `--compare` | desactivado | Corre ambos escenarios (con/sin failed retest) y muestra tabla comparativa |
 | `--no-failed-retest` | desactivado | Desactiva el filtro failed retest para ver el baseline |
+| `--trend-filter` | desactivado | Experimental: LONGs solo con SMA50w>SMA200w (validado: perjudica la estrategia, no usar en live) |
 
 ### Análisis de fallos
 
@@ -292,7 +293,7 @@ levels:
 risk:
   take_profit_pct: 3.0
   sl_behind_level_pct: 1.0
-  max_open_positions: 1
+  max_open_positions: 3  # 3 posiciones → 33.33% del capital por trade
 
 paper_trading:
   initial_balance_usdt: 1000.0
@@ -408,6 +409,10 @@ autoTrading/
 
 **Portfolio €100 capital compartido**: €100 → **€7,126 (+7,026% en 6 años)** | WR 33.7% | MaxDD -66.3%
 
+**Simulación extendida a 10 años (3 posiciones, 33.33% por trade)**:
+€100 → **€1,147 (+1,047% en 10 años)** | WR 32.1% | MaxDD -40.9% | 860 trades
+> MaxDD más bajo (-40.9% vs -66.3%) gracias a la diversificación entre 3 posiciones simultáneas.
+
 | Año | Capital acumulado |
 |-----|------------------|
 | 2020 | +3% |
@@ -492,6 +497,8 @@ Si <50%:
 - [x] Historial de trades paginado con WR, PF, mejor/peor trade
 - [x] PostgreSQL vía Docker Compose para persistencia en servidor
 - [x] Dockerfile multi-stage (Vue build + Python) — deploy en un solo contenedor
+- [x] 3 posiciones simultáneas (33.33% del capital por trade) — validado en simulación
+- [x] Filtro de tendencia semanal (`--trend-filter`) — implementado y validado: perjudica la estrategia bidireccional, desactivado por defecto
 
 ### ⏳ Fase 4b — Paper trading en vivo (iniciada: 2026-07-29)
 - [x] Paper trader arrancado en Binance Testnet — 4 símbolos, 4 filtros activos

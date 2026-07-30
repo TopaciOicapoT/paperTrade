@@ -42,8 +42,7 @@ let reconnectTimer = null
 
 function connectWS() {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${proto}//${window.location.host}/ws`
-
+    const url = `${proto}//${window.location.host}/api/ws`
     ws = new WebSocket(url)
 
     ws.onopen = () => {
