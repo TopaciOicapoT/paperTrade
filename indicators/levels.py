@@ -706,6 +706,39 @@ def evaluar_bounce(
 
 
 # ─────────────────────────────────────────────────
+# Estrategia Bounce para el paper trader en tiempo real
+# ─────────────────────────────────────────────────
+
+def evaluar_bounce_signal(
+    symbol: str,
+    df_entry: "pd.DataFrame",
+    df_diario: "pd.DataFrame",
+    config: dict,
+) -> StrategySignal | None:
+    """
+    Detecta rebotes en tiempo real y devuelve un StrategySignal compatible
+    con el paper trader. Delega en evaluar_bounce() y convierte el resultado.
+
+    El TP especial del bounce (midpoint del rango) se registra en
+    signal.confirmations como 'bounce_tp:<precio>' para que el paper trader
+    pueda usarlo en lugar del TP fijo del breakout.
+    """
+    bounce = evaluar_bounce(symbol, df_entry, df_diario, config)
+    if bounce is None:
+        return None
+
+    return StrategySignal(
+        symbol=symbol,
+        direction=bounce.direction,
+        entry_price=bounce.entry_price,
+        monthly_level=bounce.monthly_level,
+        volume_ratio=0.0,    # el bounce no requiere spike de volumen
+        confirmations=[f"bounce_tp:{bounce.take_profit:.6f}"],
+        confirmation_score=2,    # satisface el requisito mínimo de es_valida
+    )
+
+
+# ─────────────────────────────────────────────────
 # Compatibilidad con código legado (backtesting)
 # ─────────────────────────────────────────────────
 
@@ -745,3 +778,89 @@ class KeyLevels:
     daily_high: float
     daily_low: float
     current_price: float
+
+
+# ─────────────────────────────────────────────────
+# Estrategia 3: Retest post-breakout (paper trader)
+# ─────────────────────────────────────────────────
+
+def evaluar_retest_signal(
+    symbol: str,
+    df_entry: "pd.DataFrame",
+    df_diario: "pd.DataFrame",
+    config: dict,
+    retest_lookback: int = 200,
+    retest_min_move_pct: float = 0.5,
+    retest_tolerance_pct: float = 0.35,
+    retest_pullback_vol_max: float = 1.5,
+) -> StrategySignal | None:
+    """
+    Detecta una oportunidad de retest post-breakout en tiempo real.
+
+    Usa el mismo StrategySignal que la estrategia breakout para
+    ser compatible con el resto del paper trader.
+    """
+    import pandas as pd
+
+    # Leer parámetros del config por símbolo si existen
+    sp = config.get("symbol_params", {}).get(symbol, {})
+    retest_min_move_pct     = sp.get("retest_min_move_pct",     retest_min_move_pct)
+    retest_tolerance_pct    = sp.get("retest_tolerance_pct",    retest_tolerance_pct)
+    retest_pullback_vol_max = sp.get("retest_pullback_vol_max", retest_pullback_vol_max)
+
+    levels_cfg = config.get("levels", {})
+    monthly_lookback = levels_cfg.get("monthly_lookback", 6)
+
+    try:
+        monthly = calcular_niveles_mensuales(df_diario, lookback_months=monthly_lookback)
+    except Exception:
+        return None
+
+    current_price = float(df_entry["close"].iloc[-1])
+    vol_mean = float((df_entry["volume"] * df_entry["close"]).iloc[-50:].mean()) or 1.0
+    pullback_vol = float(df_entry["volume"].iloc[-1]) * float(df_entry["close"].iloc[-1])
+
+    # Volumen del pullback debe ser bajo (profit-taking silencioso)
+    if pullback_vol > vol_mean * retest_pullback_vol_max:
+        return None
+
+    recent_closes = df_entry["close"].iloc[-retest_lookback:].astype(float)
+
+    for direction, level in [("long", monthly.resistance), ("short", monthly.support)]:
+        tol = level * retest_tolerance_pct / 100
+
+        # El precio está cerca del nivel
+        if abs(current_price - level) > tol:
+            continue
+
+        # La vela cierra en el lado correcto
+        if direction == "long" and current_price < level - tol * 0.5:
+            continue
+        if direction == "short" and current_price > level + tol * 0.5:
+            continue
+
+        # En el pasado reciente, el precio se alejó suficiente del nivel
+        if direction == "long":
+            moved_away = (recent_closes - level).max() >= level * retest_min_move_pct / 100
+        else:
+            moved_away = (level - recent_closes).max() >= level * retest_min_move_pct / 100
+
+        if not moved_away:
+            continue
+
+        logger.info(
+            f"[Retest] Señal {direction.upper()} {symbol} @ {current_price:.4f} | "
+            f"Nivel: {level:.4f} | Vol pullback: {pullback_vol/vol_mean:.2f}×"
+        )
+
+        return StrategySignal(
+            symbol=symbol,
+            direction=direction,
+            entry_price=current_price,
+            monthly_level=level,
+            volume_ratio=round(pullback_vol / vol_mean, 2),
+            confirmations=["retest"],
+            confirmation_score=2,   # satisface el requisito mínimo de es_valida
+        )
+
+    return None

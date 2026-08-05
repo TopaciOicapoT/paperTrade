@@ -779,6 +779,198 @@ def analizar_combinado(resultados: list[BacktestResult]) -> None:
 
 
 # ─────────────────────────────────────────────────
+# Estrategia 3: Retest post-breakout
+# ─────────────────────────────────────────────────
+
+def simular_trades_retest(
+    df_entry: pd.DataFrame,
+    df_daily: pd.DataFrame,
+    df_weekly: pd.DataFrame | None,
+    symbol: str,
+    monthly_lookback: int = 6,
+    tp_pct: float = 3.0,
+    sl_behind_pct: float = 0.5,
+    fee_pct: float = 0.1,
+    leverage: int = 1,
+    initial_capital: float = 1000.0,
+    retest_lookback: int = 200,
+    retest_min_move_pct: float = 0.5,
+    retest_tolerance_pct: float = 0.35,
+    retest_pullback_vol_max: float = 1.5,
+    symbol_params: dict | None = None,   # sobreescribe los parámetros por símbolo
+) -> "BacktestResult":
+    """Entrada en pullback/retest post-breakout. Parámetros sobreescribibles por símbolo."""
+    # Aplicar overrides de symbol_params si existen
+    sp = (symbol_params or {}).get(symbol, {})
+    if sp:
+        retest_min_move_pct   = sp.get("retest_min_move_pct",   retest_min_move_pct)
+        retest_tolerance_pct  = sp.get("retest_tolerance_pct",  retest_tolerance_pct)
+        retest_pullback_vol_max = sp.get("retest_pullback_vol_max", retest_pullback_vol_max)
+
+    logger.disable("indicators.levels")
+
+    result = BacktestResult(symbol=symbol, initial_capital=initial_capital)
+    equity_curve = [1.0]
+    open_trade: Trade | None = None
+    lookback_days = monthly_lookback * 30
+
+    # ── Pre-calcular niveles por día (igual que en simular_trades) ──
+    daily_levels_cache: dict = {}
+    for idx in range(lookback_days, len(df_daily) - 1):
+        daily_window = df_daily.iloc[idx - lookback_days: idx + 1]
+        try:
+            lvl = calcular_niveles_mensuales(daily_window, lookback_months=monthly_lookback)
+            next_date = df_daily.index[idx + 1].date()
+            daily_levels_cache[next_date] = lvl
+        except Exception:
+            pass
+
+    logger.enable("indicators.levels")
+    logger.info(f"[Retest] Niveles pre-calculados para {len(daily_levels_cache)} días")
+
+    COOLDOWN_BARS = 288  # 24h a 5m/vela — evita re-entrar en el mismo retest
+
+    last_retest_bar: dict[str, int] = {}  # nivel_key → índice de la última entrada
+
+    for i in range(retest_lookback + 50, len(df_entry) - 1):
+        current = df_entry.iloc[i]
+        trade_just_closed = False
+
+        # ── Gestionar trade abierto ──
+        if open_trade is not None:
+            high = float(current["high"])
+            low  = float(current["low"])
+            hit_tp = hit_sl = False
+            if open_trade.direction == "long":
+                hit_tp = high >= open_trade.take_profit
+                hit_sl = low  <= open_trade.stop_loss
+            else:
+                hit_tp = low  <= open_trade.take_profit
+                hit_sl = high >= open_trade.stop_loss
+
+            if hit_tp or hit_sl:
+                open_trade.result     = "win" if hit_tp else "loss"
+                open_trade.exit_price = open_trade.take_profit if hit_tp else open_trade.stop_loss
+                open_trade.exit_index = i
+                pnl = (open_trade.exit_price - open_trade.entry_price) / open_trade.entry_price
+                if open_trade.direction == "short":
+                    pnl = -pnl
+                pnl *= leverage
+                pnl -= (fee_pct / 100) * 2
+                open_trade.pnl_pct    = round(pnl * 100, 4)
+                open_trade.bars_to_exit = i - open_trade.entry_index
+                result.trades.append(open_trade)
+                equity_curve.append(equity_curve[-1] * (1 + pnl))
+                open_trade = None
+                trade_just_closed = True
+
+        if open_trade is not None or trade_just_closed:
+            continue
+
+        current_date = df_entry.index[i].date()
+        monthly = daily_levels_cache.get(current_date)
+        if monthly is None:
+            continue
+
+        current_price = float(current["close"])
+        vol_mean = float(df_entry["volume"].iloc[max(0, i-50):i].mean()) or 1.0
+
+        # ── Probar retest de resistencia (LONG) y de soporte (SHORT) ──
+        for direction, level in [("long", monthly.resistance), ("short", monthly.support)]:
+            if direction == "short" and leverage == 1:
+                continue  # short requiere futuros
+
+            level_key = f"{direction}_{round(level, 6)}"
+
+            # Cooldown: no re-entrar en el mismo nivel hasta COOLDOWN_BARS
+            if last_retest_bar.get(level_key, 0) > i - COOLDOWN_BARS:
+                continue
+
+            tol = level * retest_tolerance_pct / 100
+
+            # 1. El precio actual está cerca del nivel
+            if abs(current_price - level) > tol:
+                continue
+
+            # 2. La vela cierra en el lado correcto del nivel
+            if direction == "long" and current_price < level - tol * 0.5:
+                continue
+            if direction == "short" and current_price > level + tol * 0.5:
+                continue
+
+            # 3. En el pasado reciente, el precio se alejó del nivel (breakout confirmado)
+            recent_closes = df_entry["close"].iloc[max(0, i - retest_lookback): i].astype(float)
+            if direction == "long":
+                # El precio estuvo por encima del nivel en algún momento reciente
+                max_above = (recent_closes - level).max()
+                if max_above < level * retest_min_move_pct / 100:
+                    continue
+            else:
+                # El precio estuvo por debajo del nivel en algún momento reciente
+                min_below = (level - recent_closes).max()
+                if min_below < level * retest_min_move_pct / 100:
+                    continue
+
+            # 4. Volumen del pullback bajo (profit-taking, no pánico)
+            pullback_vol = float(current["volume"])
+            if pullback_vol > vol_mean * retest_pullback_vol_max:
+                continue
+
+            # ── Calcular SL y TP ──
+            entry_price = current_price
+            sl_offset = entry_price * (sl_behind_pct / 100)
+            tp_dist   = entry_price * (tp_pct / 100)
+
+            if direction == "long":
+                stop_loss   = entry_price - sl_offset
+                take_profit = entry_price + tp_dist
+            else:
+                stop_loss   = entry_price + sl_offset
+                take_profit = entry_price - tp_dist
+
+            open_trade = Trade(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                stop_loss=round(stop_loss, 8),
+                take_profit=round(take_profit, 8),
+                entry_index=i,
+                level_name=f"retest_{'resistance' if direction == 'long' else 'support'}",
+                volume_ratio=round(pullback_vol / vol_mean, 2),
+                level_distance_pct=round(abs(entry_price - level) / level * 100, 3),
+            )
+            last_retest_bar[level_key] = i
+            logger.info(
+                f"[Retest] {direction.upper()} {symbol} @ {entry_price:.4f} | "
+                f"Nivel: {level:.4f} | Vol pullback: {pullback_vol/vol_mean:.2f}×"
+            )
+            break  # una sola entrada por vela
+
+    # ── Métricas finales ──
+    closed = [t for t in result.trades if t.result != "open"]
+    wins   = [t for t in closed if t.result == "win"]
+    losses = [t for t in closed if t.result == "loss"]
+
+    result.total_trades     = len(closed)
+    result.wins             = len(wins)
+    result.losses           = len(losses)
+    result.win_rate         = len(wins) / len(closed) if closed else 0
+    win_pnls                = [t.pnl_pct for t in wins]
+    loss_pnls               = [abs(t.pnl_pct) for t in losses]
+    result.avg_win_pct      = float(np.mean(win_pnls)) if win_pnls else 0
+    result.avg_loss_pct     = float(np.mean(loss_pnls)) if loss_pnls else 0
+    total_wins              = sum(win_pnls)
+    total_losses            = sum(loss_pnls)
+    result.profit_factor    = total_wins / total_losses if total_losses > 0 else float("inf")
+    result.total_return_pct = round((equity_curve[-1] - 1) * 100, 2)
+    equity                  = np.array(equity_curve)
+    peak                    = np.maximum.accumulate(equity)
+    result.max_drawdown_pct = round(float(((equity - peak) / peak).min()) * 100, 2)
+    result.equity_curve     = equity_curve
+    return result
+
+
+# ─────────────────────────────────────────────────
 # Estrategia 2: Bounce (reversión a la media)
 # ─────────────────────────────────────────────────
 

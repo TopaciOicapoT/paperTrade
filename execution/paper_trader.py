@@ -24,7 +24,7 @@ from loguru import logger
 
 from data.fetcher import get_exchange, get_data_exchange, fetch_multi_timeframe
 from data.news_fetcher import get_news_risk
-from indicators.levels import evaluar_estrategia
+from indicators.levels import evaluar_estrategia, evaluar_retest_signal, evaluar_bounce_signal
 from models.predictor import Predictor
 from risk.manager import RiskManager
 
@@ -317,26 +317,41 @@ class PaperTrader:
             if not self._verificar_noticias():
                 return
 
-            # 3. Evaluar la estrategia completa (niveles mensuales + multi-TF + volumen)
-            signal = evaluar_estrategia(
-                symbol=symbol,
-                df_entry=df_entry,
-                df_horario=df_horario,
-                df_diario=df_diario,
-                df_semanal=df_semanal,
-                config=self.config,
-            )
+            # 3. Evaluar estrategias configuradas para este símbolo
+            sym_params = self.config.get("symbol_params", {}).get(symbol, {})
+            global_strategies = self.config.get("strategies", ["breakout"])
+            active_strategies  = sym_params.get("strategies", global_strategies)
+
+            signal = None
+
+            if "breakout" in active_strategies:
+                signal = evaluar_estrategia(
+                    symbol=symbol,
+                    df_entry=df_entry,
+                    df_horario=df_horario,
+                    df_diario=df_diario,
+                    df_semanal=df_semanal,
+                    config=self.config,
+                )
+
+            if (signal is None or not signal.es_valida) and "retest" in active_strategies:
+                signal = evaluar_retest_signal(
+                    symbol=symbol,
+                    df_entry=df_entry,
+                    df_diario=df_diario,
+                    config=self.config,
+                )
+
+            if (signal is None or not signal.es_valida) and "bounce" in active_strategies:
+                signal = evaluar_bounce_signal(
+                    symbol=symbol,
+                    df_entry=df_entry,
+                    df_diario=df_diario,
+                    config=self.config,
+                )
 
             if signal is None or not signal.es_valida:
                 return
-
-            # En spot no se puede operar en corto — solo futuros permite SHORTs
-            if signal.direction == "short" and not self.futures_enabled:
-                logger.debug(f"[Spot] Señal SHORT ignorada en {symbol} — requiere futuros")
-                return
-
-            # ── Filtros de calidad de entrada (validados en validate_filters.py) ────────
-            sym_params = self.config.get("symbol_params", {}).get(symbol, {})
 
             # F2b: Filtro de sesión por símbolo (hora UTC)
             session_block = sym_params.get("session_block_hours")
@@ -412,6 +427,15 @@ class PaperTrader:
             if orden is None:
                 return
 
+            # Para el bounce el TP es el midpoint del rango (no el 3% fijo)
+            bounce_tp_tag = next((c for c in signal.confirmations if c.startswith("bounce_tp:")), None)
+            if bounce_tp_tag:
+                bounce_tp_price = float(bounce_tp_tag.split(":")[1])
+                orden = orden.__class__(
+                    **{**vars(orden), "take_profit": round(bounce_tp_price, 8),
+                       "tp_pct": abs(bounce_tp_price - orden.entry_price) / orden.entry_price * 100}
+                )
+
             # ── Verificación de liquidación (futuros) ──
             # La liquidación ocurre cuando el movimiento adverso ≈ 1/leverage
             # El SL DEBE estar siempre antes del precio de liquidación.
@@ -466,6 +490,47 @@ class PaperTrader:
             logger.error(f"Error inesperado procesando {symbol}: {e}", exc_info=True)
 
     # ── API de control (usada por el dashboard web) ──────────────────────────
+
+    def reload_config(self, new_config: dict):
+        """Aplica un config actualizado en caliente sin reiniciar el bot."""
+        self.config = new_config
+
+        risk_cfg = new_config["risk"]
+        # Recrea el RiskManager preservando las posiciones abiertas actuales
+        open_syms = list(self.open_orders.keys())
+        self.risk_manager = RiskManager(
+            max_risk_pct=risk_cfg["max_risk_per_trade_pct"],
+            tp_pct=risk_cfg["take_profit_pct"],
+            tp_min_pct=risk_cfg["tp_min_pct"],
+            tp_max_pct=risk_cfg["tp_max_pct"],
+            sl_behind_pct=risk_cfg["sl_behind_level_pct"],
+            max_positions=risk_cfg["max_open_positions"],
+        )
+        for sym in open_syms:
+            self.risk_manager.registrar_apertura(sym)
+
+        self.symbols = new_config["symbols"]
+
+        futures_cfg = new_config.get("futures", {})
+        self.futures_enabled = futures_cfg.get("enabled", False)
+        self.leverage        = futures_cfg.get("leverage", 1)
+        self.fee_pct = 0.0004 if self.futures_enabled else new_config["paper_trading"].get("fee_pct", 0.1) / 100
+
+        guardrails = new_config.get("guardrails", {})
+        self.max_daily_loss_pct = guardrails.get("max_daily_loss_pct", 3.0) / 100
+        self.max_drawdown_pct   = guardrails.get("max_drawdown_pct", 10.0) / 100
+
+        news_cfg = new_config.get("news", {})
+        self._news_enabled        = news_cfg.get("enabled", False)
+        self._news_pause_hours    = news_cfg.get("pause_hours", 4)
+        self._news_check_interval = news_cfg.get("check_interval_minutes", 15) * 60
+
+        logger.info(
+            f"Config recargada en caliente | "
+            f"Símbolos: {self.symbols} | "
+            f"Posiciones: {risk_cfg['max_open_positions']} | "
+            f"Leverage: {self.leverage}×"
+        )
 
     def get_snapshot(self) -> dict:
         """Devuelve el estado completo del bot para la API REST / WebSocket."""

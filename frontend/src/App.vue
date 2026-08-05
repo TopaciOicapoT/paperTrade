@@ -1,7 +1,23 @@
 <script setup>
+import { ref } from "vue";
 import BotStatus from "./components/BotStatus.vue";
 import OpenPositions from "./components/OpenPositions.vue";
+import LevelsPanel from "./components/LevelsPanel.vue";
 import TradeHistory from "./components/TradeHistory.vue";
+import LabView from "./components/LabView.vue";
+import ConfigEditor from "./components/ConfigEditor.vue";
+
+const tab = ref("dashboard");
+const labNotification = ref(false);
+
+function goLab() {
+  tab.value = "lab";
+  labNotification.value = false;
+}
+
+function onSimulationDone() {
+  if (tab.value !== "lab") labNotification.value = true;
+}
 </script>
 
 <template>
@@ -9,29 +25,52 @@ import TradeHistory from "./components/TradeHistory.vue";
     <header class="topbar">
       <div class="logo">📈 PaperTrade</div>
       <nav class="nav">
-        <a
-          href="http://localhost:8000/docs"
-          target="_blank"
-          rel="noopener"
-          class="nav-link"
+        <button
+          class="tab-btn"
+          :class="{ active: tab === 'dashboard' }"
+          @click="tab = 'dashboard'"
         >
-          API Docs
-        </a>
+          Dashboard
+        </button>
+        <button
+          class="tab-btn"
+          :class="{ active: tab === 'lab' }"
+          @click="goLab"
+        >
+          Laboratorio
+          <span v-if="labNotification" class="notif-dot" />
+        </button>
+        <button
+          class="tab-btn"
+          :class="{ active: tab === 'config' }"
+          @click="tab = 'config'"
+        >
+          Configuración
+        </button>
+        <a href="/docs" target="_blank" rel="noopener" class="nav-link"
+          >API Docs</a
+        >
       </nav>
     </header>
 
     <main class="main">
-      <section class="panel">
-        <BotStatus />
-      </section>
+      <!-- v-show en vez de v-if: los componentes no se destruyen al cambiar pestaña -->
+      <div v-show="tab === 'dashboard'">
+        <section class="panel"><BotStatus /></section>
+        <section class="panel"><OpenPositions /></section>
+        <section class="panel"><LevelsPanel /></section>
+        <section class="panel"><TradeHistory /></section>
+      </div>
 
-      <section class="panel">
-        <OpenPositions />
-      </section>
+      <div v-show="tab === 'lab'">
+        <section class="panel panel-wide">
+          <LabView @simulation-done="onSimulationDone" />
+        </section>
+      </div>
 
-      <section class="panel">
-        <TradeHistory />
-      </section>
+      <div v-show="tab === 'config'">
+        <section class="panel panel-wide"><ConfigEditor /></section>
+      </div>
     </main>
   </div>
 </template>
@@ -62,10 +101,53 @@ import TradeHistory from "./components/TradeHistory.vue";
   letter-spacing: -0.02em;
 }
 
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  padding: 0.35rem 0.9rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.15s;
+}
+.tab-btn:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+.tab-btn.active {
+  color: var(--text);
+  background: var(--bg);
+  border-color: var(--border);
+  font-weight: 600;
+}
+
+.notif-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  background: var(--red);
+  border-radius: 50%;
+  margin-left: 4px;
+  vertical-align: middle;
+  box-shadow: 0 0 5px var(--red);
+}
+
+.panel-wide {
+  max-width: 100%;
+}
+
 .nav-link {
   font-size: 0.8rem;
   color: var(--text-muted);
   text-decoration: none;
+  margin-left: 0.5rem;
 }
 .nav-link:hover {
   color: var(--text);
