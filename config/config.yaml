@@ -13,9 +13,9 @@ levels:
   bounce_min_range_pct: 2.0
   bounce_wick_min_pct: 0.1
   daily_lookback: 20
-  failed_retest_auto_lookback: 500
+  failed_retest_auto_lookback: 2500  # 2500×1m = ~41h (equiv. a 500×5m de la simulación)
   failed_retest_filter: auto
-  failed_retest_lookback: 60
+  failed_retest_lookback: 300  # 300×1m = 5h (equiv. a 60×5m de la simulación)
   failed_retest_min_bounce_pct: 0.3
   hourly_lookback: 48
   monthly_lookback: 6

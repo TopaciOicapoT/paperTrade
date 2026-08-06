@@ -4,17 +4,19 @@ Bot de breakout de niveles mensuales para criptomonedas. Detecta cuando el preci
 
 - **Estrategia principal**: breakout de máximos/mínimos mensuales + confirmación multi-timeframe + volumen 2.0-3.0× (ajustado por símbolo)
 - **Estrategia 2 (en testing)**: retest post-breakout — entrada en el pullback al nivel roto cuando el precio lo respeta de nuevo
+- **Estrategia 3 (en testing)**: bounce en nivel — entrada en rechazo con mecha, TP en el midpoint del rango mensual
 - **Anti-fakeout adaptativo**: filtro *failed retest* con auto-detección de régimen
 - **Cartera validada a 6 años**: 4 símbolos con 4 filtros per-símbolo | €100 → €7,126 (+7,026%) en simulación compartida
 - **Exchange**: Binance (datos reales públicos) / Binance Testnet (paper trading) → Bybit (futuro, trading real)
 - **TP**: 3% desde entrada | **SL**: 1% (breakout) / 0.5% (retest) | **R:R**: 3:1 / 6:1
 - **4 filtros per-símbolo**: F1 momentum, F2b sesión UTC, F3 volumen USDT Q3, F4 RSI14 sobrecompra
+- **Laboratorio**: simulación por (símbolo + estrategia) con filtros independientes por estrategia — sin mezclar parámetros
+- **Registro de señales**: toda señal detectada por el bot se guarda en DB (trades tomados + rechazados con razón exacta)
 - **ML**: XGBoost para filtrar señales — mejora con cada semana de trades reales acumulados
 - **Resiliencia**: estado persistido en disco, auto-reinicio ante crashes, circuit breaker diario
 - **News circuit breaker**: pausa automática ante eventos macro sin API key (Fear & Greed + RSS)
 - **Futuros**: soporte para USDT-M perpetuos con leverage configurable (default 3×)
 - **Dashboard web**: API REST + WebSocket (FastAPI) + frontend Vue 3 — control total desde el navegador
-- **Laboratorio**: simulación interactiva con selección de símbolos, filtros, estrategias y rango de fechas
 - **Configuración hot-reload**: cambios aplicados sin reiniciar el bot
 - **Deploy en servidor**: Docker Compose con PostgreSQL para alojar en cualquier VPS
 
@@ -243,6 +245,7 @@ El Dockerfile hace el build de Vue y FastAPI sirve el `frontend/dist/` en `/`. S
 | GET | `/api/history` | Historial de trades paginado |
 | GET | `/api/history/stats` | WR, PF, PnL total, mejor/peor trade |
 | GET | `/api/levels` | Niveles mensuales + diagnóstico de filtros por símbolo |
+| GET | `/api/events` | Registro de señales del bot (trades + rechazos con razón) |
 | POST | `/api/lab/simulate` | Lanzar simulación en background (devuelve job_id) |
 | GET | `/api/lab/jobs/{id}` | Estado + progreso + resultado de una simulación |
 | POST | `/api/lab/jobs/{id}/cancel` | Cancelar simulación en curso |
@@ -296,8 +299,8 @@ levels:
   volume_trigger_ratio: 2.0
   volume_trigger_ratio_max: 3.0
   failed_retest_filter: "auto"
-  failed_retest_lookback: 60
-  failed_retest_auto_lookback: 500
+  failed_retest_lookback: 300       # 300×1m = 5h (equivalente a 60×5m de la simulación)
+  failed_retest_auto_lookback: 2500 # 2500×1m = ~41h (equivalente a 500×5m de la simulación)
   failed_retest_min_bounce_pct: 0.3
 
 risk:
@@ -361,11 +364,12 @@ autoTrading/
 │   ├── schemas.py              # Modelos Pydantic de request/response
 │   ├── db/
 │   │   ├── database.py         # SQLAlchemy engine (PostgreSQL / SQLite fallback)
-│   │   └── models.py           # Tabla trades en DB
+│   │   └── models.py           # Tablas: trades, signal_events
 │   └── routers/
 │       ├── bot.py              # /api/state, /api/emergency, /api/resume, WS /ws
 │       ├── trades.py           # /api/positions, /api/history
 │       ├── levels.py           # /api/levels — niveles + diagnóstico de filtros en vivo
+│       ├── events.py           # /api/events — registro de señales (trades + rechazos)
 │       ├── lab.py              # /api/lab/* — simulaciones en background
 │       └── config_editor.py    # /api/config GET/PATCH — hot-reload de configuración
 ├── frontend/
@@ -381,7 +385,8 @@ autoTrading/
 │           ├── OpenPositions.vue  # Tabla posiciones + cerrar individual + EMERGENCY STOP
 │           ├── LevelsPanel.vue    # Niveles mensuales + estado de filtros en tiempo real
 │           ├── TradeHistory.vue   # Historial paginado con estadísticas
-│           ├── LabView.vue        # Laboratorio de simulación interactiva
+│           ├── SignalLog.vue      # Registro de señales (trades + rechazados con razón)
+│           ├── LabView.vue        # Laboratorio: simulación por (símbolo + estrategia)
 │           └── ConfigEditor.vue   # Editor de configuración del bot (hot-reload)
 ├── config/
 │   └── config.yaml             # Parámetros de la estrategia
@@ -519,34 +524,42 @@ Si <50%:
 
 ### ✅ Fase 4c — Laboratorio y Configuración (completada: 2026-08)
 - [x] **Panel de niveles** en tiempo real: estado de cada símbolo + diagnóstico de filtros (qué bloquea la entrada y por qué)
-- [x] **Laboratorio de simulación** interactivo: selección de símbolos, filtros, estrategias y rango de fechas
+- [x] **Laboratorio de simulación** con modelo por (símbolo + estrategia): cada entrada tiene sus propios filtros sin interferir con otras estrategias del mismo símbolo
+- [x] El mismo símbolo puede añadirse varias veces con distintas estrategias (ADA·Breakout con F1+F3, ADA·Retest con sus propios parámetros)
 - [x] Simulación doble (sin filtros vs con filtros) con comparativa por símbolo, año a año, volumen y dirección
 - [x] Análisis de impacto individual por filtro (F1, F2b, F3, F4, Failed retest) — delta de WR vs baseline
-- [x] Tabs por símbolo con historial de trades (fecha exacta, precio entrada/salida, modal de detalle)
+- [x] Tabs por (símbolo · estrategia) con historial de trades, modal de detalle
 - [x] Simulación por **rango de fechas** (ej. bear market 2022) además de por años
 - [x] Persistencia del job de simulación en `localStorage` — sobrevive refresco de página
 - [x] Cancelación de simulación con modal de confirmación
-- [x] **Editor de configuración** visual: símbolos activos, estrategias, filtros F1-F4 y parámetros de retest por símbolo
+- [x] **Editor de configuración** visual con el mismo modelo por-estrategia: tarjetas separadas por (símbolo + estrategia), cada una con sus propios filtros
+- [x] Al guardar, las estrategias del mismo símbolo se fusionan en el formato flat de `config.yaml` compatible con el paper trader
 - [x] **Hot-reload** de configuración sin reiniciar el bot (aplica en el siguiente ciclo de 10s)
 - [x] Nav de 3 pestañas: Dashboard / Laboratorio / Configuración (estado persistente entre pestañas)
 - [x] Punto rojo de notificación en pestaña Laboratorio cuando termina una simulación fuera de foco
 - [x] 32 símbolos disponibles en el Laboratorio (agrupados por categoría)
 
-### ✅ Fase 4d — Estrategia Retest (implementada: 2026-08)
+### ✅ Fase 4d — Estrategias Retest y Bounce (implementadas: 2026-08)
 - [x] `simular_trades_retest()` en el engine — entrada en pullback post-breakout cuando el precio respeta el nivel roto
 - [x] `evaluar_retest_signal()` para detección en tiempo real en el paper trader
 - [x] Parámetros por símbolo: `retest_min_move_pct`, `retest_tolerance_pct`, `retest_pullback_vol_max`
+- [x] `evaluar_bounce_signal()` en tiempo real — rebote en nivel mensual con mecha, TP en midpoint
 - [x] Campo `strategies` per-símbolo en config.yaml — cada moneda puede usar diferentes estrategias
-- [x] Validación de parámetros con sweep de 3 años — ADA/LINK en forward testing con SL ajustado
+- [x] Validación de parámetros retest con sweep de 3 años: ADA mantiene params base, EGLD con params custom
 - [x] SL del retest: 0.5% (vs 1% del breakout) — nivel ya confirmado, riesgo más ajustado
 - [x] R:R del retest: 6:1 — breakeven en WR 14% (vs 25% del breakout)
+- [x] **Registro de señales en DB** (`signal_events`): cada señal detectada se persiste con timestamp, símbolo, estrategia, dirección, precio, razón de rechazo — auditoría completa del comportamiento del bot
+- [x] **Panel de señales** en el dashboard: últimas 200 señales en tiempo real con filtros por símbolo y tipo (trades, rechazados por filtro/IA/riesgo/capacidad)
+- [x] **Bug fix crítico**: `predictor.predecir()` devolvía `0.0` (bloqueando trades) cuando el modelo no está disponible en vez de `1.0` (bypasear)
+- [x] **Bug fix crítico**: `failed_retest_lookback` escalado a 300 y `auto_lookback` a 2500 para candles 1m — la simulación usa 5m (factor 5×), el bot en producción usaba valores para 5m pero procesando 1m, bloqueando el 100% de las señales
 
-### ⏳ Fase 4b — Paper trading en vivo (iniciada: 2026-07-29)
-- [x] Paper trader arrancado en Binance Testnet — 5 símbolos (ADA, LINK, EGLD, ATOM, DOGE), filtros activos
-- [x] Ciclo 60s, futuros 3×, balance 1000 USDT inicial
-- [x] Estrategia Retest activa en ADA y LINK en modo forward testing (SL 0.5%, datos reales acumulando)
+### ⏳ Fase 4b — Paper trading en vivo (en curso: 2026-07-29)
+- [x] Paper trader arrancado en Binance Testnet — 4 símbolos (ADA, LINK, EGLD, ATOM), filtros activos
+- [x] Ciclo 10s, futuros 3×, balance 1000 USDT inicial
+- [x] Registro de señales activo — auditoría completa de cada ciclo (trades tomados + rechazados)
+- [x] Bug crítico corregido: 0 trades en semanas de funcionamiento por `failed_retest_lookback` mal escalado para 1m
 - [ ] Acumular ≥ 50 trades de breakout con WR cercana al backtest (32-38%)
-- [ ] Acumular ≥ 20 trades de retest en ADA/LINK para validar parámetros con datos reales
+- [ ] Acumular ≥ 20 trades de retest en ADA para validar parámetros con datos reales
 - [ ] Reentrenar XGBoost cada semana con trades acumulados
 - [ ] Validar que los filtros per-símbolo se comportan igual en tiempo real
 - [ ] Verificar ausencia de bugs de ejecución durante al menos 4 semanas
@@ -585,4 +598,4 @@ Si <50%:
 - [ ] Sincronizar balance real al arrancar desde el exchange
 - [ ] Curva de equity en el dashboard (gráfico de balance histórico)
 - [ ] Autenticación básica en el dashboard (usuario + contraseña)
-- [ ] Contrafactual logging: registrar señales rechazadas para entrenar el modelo con datos más completos
+- [ ] Usar `signal_events` para reentrenar el modelo XGBoost con señales rechazadas (contrafactual learning)

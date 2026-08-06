@@ -48,8 +48,8 @@ class Predictor:
             no está disponible o faltan datos.
         """
         if not self.model_disponible():
-            logger.warning("Modelo no disponible — se omite filtro IA")
-            return 0.0
+            logger.debug("Modelo no disponible — filtro IA bypaseado")
+            return 1.0  # sin modelo = no filtrar, dejar pasar
 
         if len(df) < 30:
             logger.warning("Insuficientes velas para calcular features")

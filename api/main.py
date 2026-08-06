@@ -25,7 +25,7 @@ from loguru import logger
 
 from api.bot_runner import BotRunner
 from api.db.database import create_tables
-from api.routers import bot, trades, levels, lab, config_editor
+from api.routers import bot, trades, levels, lab, config_editor, events
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.yaml"
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
@@ -110,6 +110,7 @@ app.include_router(trades.router)
 app.include_router(levels.router)
 app.include_router(lab.router)
 app.include_router(config_editor.router)
+app.include_router(events.router)
 
 # Servir el build de React si ya existe (producción)
 # StaticFiles solo maneja HTTP — ignorar silenciosamente WebSocket upgrades

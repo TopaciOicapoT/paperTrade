@@ -296,6 +296,34 @@ class PaperTrader:
             self.risk_manager.registrar_cierre(symbol)
             self._guardar_estado()
 
+    def _log_event(
+        self, symbol: str, strategy: str, event_type: str,
+        direction: str | None = None, price: float | None = None,
+        level_name: str | None = None, volume_ratio: float | None = None,
+        rejection_reason: str | None = None, details: dict | None = None,
+    ):
+        """Persiste un evento de señal en la DB de forma no-bloqueante."""
+        import json as _json
+        try:
+            from api.db.database import SessionLocal
+            from api.db.models import SignalEvent
+            from datetime import datetime
+            db = SessionLocal()
+            try:
+                ev = SignalEvent(
+                    timestamp=datetime.utcnow(),
+                    symbol=symbol, strategy=strategy, event_type=event_type,
+                    direction=direction, price=price, level_name=level_name,
+                    volume_ratio=volume_ratio, rejection_reason=rejection_reason,
+                    details=_json.dumps(details) if details else None,
+                )
+                db.add(ev)
+                db.commit()
+            finally:
+                db.close()
+        except Exception as _e:
+            logger.debug(f"[EventLog] No se pudo guardar evento: {_e}")
+
     def _procesar_simbolo(self, symbol: str):
         """Ciclo completo de análisis y decisión para un símbolo."""
         try:
@@ -309,63 +337,77 @@ class PaperTrader:
             # 1. Verificar órdenes abiertas
             self._verificar_ordenes_abiertas(symbol, data)
 
-            # 2. Solo buscar nuevas entradas si hay capacidad
-            if not self.risk_manager.puede_abrir_posicion(symbol):
-                return
-
-            # 2b. Verificar news circuit breaker (solo bloquea nuevas entradas)
-            if not self._verificar_noticias():
-                return
-
-            # 3. Evaluar estrategias configuradas para este símbolo
             sym_params = self.config.get("symbol_params", {}).get(symbol, {})
             global_strategies = self.config.get("strategies", ["breakout"])
             active_strategies  = sym_params.get("strategies", global_strategies)
 
+            # 2. Evaluar señales PRIMERO (antes de capacity/news) para poder loggear todo
             signal = None
+            strategy_used = None
 
             if "breakout" in active_strategies:
-                signal = evaluar_estrategia(
-                    symbol=symbol,
-                    df_entry=df_entry,
-                    df_horario=df_horario,
-                    df_diario=df_diario,
-                    df_semanal=df_semanal,
-                    config=self.config,
+                s = evaluar_estrategia(
+                    symbol=symbol, df_entry=df_entry, df_horario=df_horario,
+                    df_diario=df_diario, df_semanal=df_semanal, config=self.config,
                 )
+                if s and s.es_valida:
+                    signal, strategy_used = s, "breakout"
 
-            if (signal is None or not signal.es_valida) and "retest" in active_strategies:
-                signal = evaluar_retest_signal(
-                    symbol=symbol,
-                    df_entry=df_entry,
-                    df_diario=df_diario,
-                    config=self.config,
+            if signal is None and "retest" in active_strategies:
+                s = evaluar_retest_signal(
+                    symbol=symbol, df_entry=df_entry, df_diario=df_diario, config=self.config,
                 )
+                if s and s.es_valida:
+                    signal, strategy_used = s, "retest"
 
-            if (signal is None or not signal.es_valida) and "bounce" in active_strategies:
-                signal = evaluar_bounce_signal(
-                    symbol=symbol,
-                    df_entry=df_entry,
-                    df_diario=df_diario,
-                    config=self.config,
+            if signal is None and "bounce" in active_strategies:
+                s = evaluar_bounce_signal(
+                    symbol=symbol, df_entry=df_entry, df_diario=df_diario, config=self.config,
                 )
+                if s and s.es_valida:
+                    signal, strategy_used = s, "bounce"
 
-            if signal is None or not signal.es_valida:
+            # Sin señal → salir silenciosamente (no loggear, demasiado frecuente)
+            if signal is None:
                 return
 
-            # F2b: Filtro de sesión por símbolo (hora UTC)
+            current_price = float(df_entry["close"].iloc[-1])
+            _log_base = dict(
+                symbol=symbol, strategy=strategy_used,
+                direction=signal.direction, price=current_price,
+                level_name=getattr(signal, "level_name", None),
+                volume_ratio=signal.volume_ratio,
+            )
+
+            # ── Comprobaciones post-señal con logging ─────────────────────────
+
+            # Capacity
+            if not self.risk_manager.puede_abrir_posicion(symbol):
+                self._log_event(
+                    **_log_base, event_type="REJECTED_CAPACITY",
+                    rejection_reason=f"Posiciones abiertas: {len(self.open_orders)}/{self.risk_manager.max_positions}",
+                )
+                return
+
+            # News circuit breaker
+            if not self._verificar_noticias():
+                self._log_event(**_log_base, event_type="REJECTED_NEWS",
+                                rejection_reason="News circuit breaker activo")
+                return
+
+            # F2b: Sesión UTC
             session_block = sym_params.get("session_block_hours")
             if session_block:
                 lo_h, hi_h = session_block
                 now_hour = pd.Timestamp.now(tz="UTC").hour
                 if lo_h <= now_hour < hi_h:
-                    logger.debug(
-                        f"[SesiónBlock] {symbol} — hora {now_hour}h UTC dentro "
-                        f"de zona bloqueada ({lo_h}-{hi_h}h)"
+                    self._log_event(
+                        **_log_base, event_type="REJECTED_SESSION",
+                        rejection_reason=f"Sesión bloqueada {lo_h}-{hi_h}h UTC (hora actual: {now_hour}h)",
                     )
                     return
 
-            # F3: Filtro de volumen USDT normalizado (zona trampa 2.1-2.7× la media)
+            # F3: Volumen USDT normalizado
             usdt_block = sym_params.get("usdt_norm_block_range")
             if usdt_block:
                 lo_v, hi_v = usdt_block
@@ -373,13 +415,14 @@ class PaperTrader:
                 mean_vol  = (df_entry["volume"] * df_entry["close"]).iloc[-50:].mean()
                 usdt_norm = last_vol / mean_vol if mean_vol > 0 else 1.0
                 if lo_v <= usdt_norm <= hi_v:
-                    logger.debug(
-                        f"[VolBlock] {symbol} — vol norm {usdt_norm:.2f}× en zona trampa "
-                        f"({lo_v}-{hi_v}×)"
+                    self._log_event(
+                        **_log_base, event_type="REJECTED_VOLUME",
+                        rejection_reason=f"Vol USDT norm {usdt_norm:.2f}× en zona trampa [{lo_v}-{hi_v}×]",
+                        details={"usdt_norm": round(usdt_norm, 3)},
                     )
                     return
 
-            # F1: Filtro de momentum 5 velas (zona trampa Q3, solo ADA)
+            # F1: Momentum 5 velas
             mom_block = sym_params.get("momentum_q3_block")
             if mom_block and len(df_entry) >= 6:
                 lo_m, hi_m = mom_block
@@ -387,47 +430,55 @@ class PaperTrader:
                 curr_close = float(df_entry["close"].iloc[-1])
                 momentum_5 = (curr_close - prev5) / prev5 * 100
                 if lo_m <= momentum_5 <= hi_m:
-                    logger.debug(
-                        f"[MomBlock] {symbol} — momentum {momentum_5:.2f}% en zona trampa "
-                        f"({lo_m}-{hi_m}%)"
+                    self._log_event(
+                        **_log_base, event_type="REJECTED_MOMENTUM",
+                        rejection_reason=f"Momentum {momentum_5:.2f}% en zona trampa [{lo_m}-{hi_m}%]",
+                        details={"momentum_5v": round(momentum_5, 3)},
                     )
                     return
 
-            # F4: Filtro RSI14 sobrecompra (RSI≥70 → WR 25.9%, bloquear)
+            # F4: RSI14 sobrecompra
             import numpy as _np
-            rsi_block = sym_params.get("rsi_overbought_block",
-                                       self.config.get("rsi_overbought_block"))
+            rsi_block = sym_params.get("rsi_overbought_block", self.config.get("rsi_overbought_block"))
+            rsi14: float | None = None
             if rsi_block is not None and len(df_entry) >= 14:
                 closes14 = df_entry["close"].iloc[-14:].astype(float).values
-                deltas = _np.diff(closes14)
+                deltas   = _np.diff(closes14)
                 avg_gain = _np.where(deltas > 0, deltas, 0.0).mean()
                 avg_loss = _np.where(deltas < 0, -deltas, 0.0).mean()
-                rsi14 = (100.0 - 100.0 / (1.0 + avg_gain / avg_loss)) if avg_loss > 0 else 100.0
+                rsi14    = (100.0 - 100.0 / (1.0 + avg_gain / avg_loss)) if avg_loss > 0 else 100.0
                 if rsi14 >= rsi_block:
-                    logger.debug(
-                        f"[RSIBlock] {symbol} — RSI14 {rsi14:.1f} ≥ {rsi_block} (sobrecompra)"
+                    self._log_event(
+                        **_log_base, event_type="REJECTED_RSI",
+                        rejection_reason=f"RSI14 {rsi14:.1f} ≥ {rsi_block} (sobrecompra)",
+                        details={"rsi14": round(rsi14, 1)},
                     )
                     return
 
-            # 4. Filtro IA (capa adicional de validación)
+            # Filtro IA
             autorizado, prob = self.predictor.autorizar_entrada(df_entry)
             if not autorizado:
+                self._log_event(
+                    **_log_base, event_type="REJECTED_AI",
+                    rejection_reason=f"Modelo IA rechazó (prob={prob:.2f} < umbral)",
+                    details={"ai_prob": round(prob, 4), "rsi14": round(rsi14, 1) if rsi14 else None},
+                )
                 return
 
-            # 5. Calcular parámetros de riesgo
+            # Calcular parámetros de riesgo
             orden = self.risk_manager.calcular_orden(
-                symbol=symbol,
-                direction=signal.direction,
-                entry_price=signal.entry_price,
-                monthly_level=signal.monthly_level,
-                balance_usdt=self.balance_usdt,
-                volume_ratio=signal.volume_ratio,
+                symbol=symbol, direction=signal.direction,
+                entry_price=signal.entry_price, monthly_level=signal.monthly_level,
+                balance_usdt=self.balance_usdt, volume_ratio=signal.volume_ratio,
             )
-
             if orden is None:
+                self._log_event(
+                    **_log_base, event_type="REJECTED_RISK",
+                    rejection_reason="RiskManager rechazó el tamaño de orden (capital insuficiente o SL inválido)",
+                )
                 return
 
-            # Para el bounce el TP es el midpoint del rango (no el 3% fijo)
+            # Override TP para bounce
             bounce_tp_tag = next((c for c in signal.confirmations if c.startswith("bounce_tp:")), None)
             if bounce_tp_tag:
                 bounce_tp_price = float(bounce_tp_tag.split(":")[1])
@@ -436,9 +487,7 @@ class PaperTrader:
                        "tp_pct": abs(bounce_tp_price - orden.entry_price) / orden.entry_price * 100}
                 )
 
-            # ── Verificación de liquidación (futuros) ──
-            # La liquidación ocurre cuando el movimiento adverso ≈ 1/leverage
-            # El SL DEBE estar siempre antes del precio de liquidación.
+            # Verificación de liquidación en futuros
             if self.futures_enabled and self.leverage > 1:
                 margin_rate = 1 / self.leverage
                 if orden.direction == "long":
@@ -448,10 +497,10 @@ class PaperTrader:
                     liq_price = orden.entry_price * (1 + margin_rate * 0.9)
                     safe = orden.stop_loss < liq_price
                 if not safe:
-                    logger.warning(
-                        f"[Futuros] SL peligroso en {symbol}: "
-                        f"SL={orden.stop_loss:.4f} está más allá del precio de liquidación "
-                        f"{liq_price:.4f} con {self.leverage}x — trade cancelado"
+                    self._log_event(
+                        **_log_base, event_type="REJECTED_RISK",
+                        rejection_reason=f"SL {orden.stop_loss:.4f} más allá de liquidación {liq_price:.4f} con {self.leverage}x",
+                        details={"sl": orden.stop_loss, "liq_price": liq_price, "leverage": self.leverage},
                     )
                     return
                 logger.debug(
@@ -459,7 +508,7 @@ class PaperTrader:
                     f"SL en {orden.stop_loss:.4f} — margen seguro OK"
                 )
 
-            # 6. Registrar la orden (paper)
+            # 6. Registrar la orden (paper) y loggear el evento
             order_record = {
                 "symbol": symbol,
                 "direction": orden.direction,
@@ -484,6 +533,14 @@ class PaperTrader:
             self.open_orders[symbol] = order_record
             self.risk_manager.registrar_apertura(symbol)
             self._guardar_estado()
+            self._log_event(
+                symbol=symbol, strategy=strategy_used, event_type="TRADE_OPENED",
+                direction=orden.direction, price=orden.entry_price,
+                level_name=getattr(signal, "level_name", None),
+                volume_ratio=signal.volume_ratio,
+                details={"sl": orden.stop_loss, "tp": orden.take_profit,
+                         "ai_prob": round(prob, 4), "leverage": self.leverage},
+            )
             logger.success(f"Orden PAPER abierta: {orden.resumen()}")
 
         except Exception as e:

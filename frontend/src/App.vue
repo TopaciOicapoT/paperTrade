@@ -6,6 +6,7 @@ import LevelsPanel from "./components/LevelsPanel.vue";
 import TradeHistory from "./components/TradeHistory.vue";
 import LabView from "./components/LabView.vue";
 import ConfigEditor from "./components/ConfigEditor.vue";
+import SignalLog from "./components/SignalLog.vue";
 
 const tab = ref("dashboard");
 const labNotification = ref(false);
@@ -60,6 +61,7 @@ function onSimulationDone() {
         <section class="panel"><OpenPositions /></section>
         <section class="panel"><LevelsPanel /></section>
         <section class="panel"><TradeHistory /></section>
+        <section class="panel"><SignalLog /></section>
       </div>
 
       <div v-show="tab === 'lab'">
