@@ -58,7 +58,13 @@ def run_simulation(
         if progress_cb:
             progress_cb(f"SYM:{idx}:{len(symbols)}:{sym}")
 
-        fetch_days = days + extra_days + 60
+        # Con rango de fechas hay que descargar desde date_from hasta hoy, no solo el span del rango
+        if date_from:
+            from datetime import date as _date
+            days_back = (_date.today() - _date.fromisoformat(date_from)).days
+            fetch_days = days_back + extra_days + 60
+        else:
+            fetch_days = days + extra_days + 60
         df_5m = fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange)
         df_1d = fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange)
         df_1w = fetch_ohlcv(sym, "1w", limit=220, exchange=exchange)
@@ -101,6 +107,8 @@ def run_simulation(
                         failed_retest_filter=bp.get("failed_retest_filter", True) if apply_filters else False,
                         symbol_params={sym: bp} if bp else None,
                         rsi_overbought_block=bp.get("rsi_overbought_block") if apply_filters else None,
+                        _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
+                        _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
                         **_common_kw,
                     )
                     entry_trades.extend(res.trades)
@@ -111,6 +119,8 @@ def run_simulation(
                         df_entry=df_5m,
                         sl_behind_pct=0.5,
                         symbol_params={sym: ep},
+                        _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
+                        _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
                         **_common_kw,
                     )
                     entry_trades.extend(res_rt.trades)
@@ -167,6 +177,8 @@ def run_simulation(
                 failed_retest_filter=apply_filters,
                 symbol_params=sym_params,
                 rsi_overbought_block=rsi_block,
+                _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
+                _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
             )
             sym_trades_all.extend(res.trades)
 
@@ -184,6 +196,8 @@ def run_simulation(
                 leverage=leverage,
                 initial_capital=capital,
                 symbol_params=sym_params,
+                _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
+                _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
             )
             sym_trades_all.extend(res_rt.trades)
 
@@ -366,8 +380,16 @@ def run_simulation(
                     "exit_price":  s.get("exit_price", 0),
                     "volume_ratio": round(s.get("volume_ratio", 0), 2),
                 }
-                for s in executed if s["symbol"] == ek
-            ][-300:]
+                # Más recientes primero; limitado a 500 por símbolo
+                for s in sorted(
+                    [s for s in executed if s["symbol"] == ek],
+                    key=lambda x: x["entry_ts"], reverse=True
+                )[:500]
+            ]
+            for ek in entry_keys
+        },
+        "trades_total_por_simbolo": {
+            ek: sum(1 for s in executed if s["symbol"] == ek)
             for ek in entry_keys
         },
     }
@@ -422,7 +444,12 @@ def run_filter_analysis(
             progress_cb(f"FILTERANAL:{ek}")
 
         if sym not in _data_cache:
-            fetch_days = days + extra_days + 60
+            if date_from:
+                from datetime import date as _date
+                days_back = (_date.today() - _date.fromisoformat(date_from)).days
+                fetch_days = days_back + extra_days + 60
+            else:
+                fetch_days = days + extra_days + 60
             df_5m = fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange)
             df_1d = fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange)
             df_1w = fetch_ohlcv(sym, "1w", limit=220, exchange=exchange)

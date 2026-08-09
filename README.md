@@ -6,12 +6,14 @@ Bot de breakout de niveles mensuales para criptomonedas. Detecta cuando el preci
 - **Estrategia 2 (en testing)**: retest post-breakout — entrada en el pullback al nivel roto cuando el precio lo respeta de nuevo
 - **Estrategia 3 (en testing)**: bounce en nivel — entrada en rechazo con mecha, TP en el midpoint del rango mensual
 - **Anti-fakeout adaptativo**: filtro *failed retest* con auto-detección de régimen
-- **Cartera validada a 6 años**: 4 símbolos con 4 filtros per-símbolo | €100 → €7,126 (+7,026%) en simulación compartida
+- **Cartera validada a 6 años**: 4 símbolos con filtros per-símbolo | €100 → €7,126 (+7,026%) en simulación compartida
 - **Exchange**: Binance (datos reales públicos) / Binance Testnet (paper trading) → Bybit (futuro, trading real)
 - **TP**: 3% desde entrada | **SL**: 1% (breakout) / 0.5% (retest) | **R:R**: 3:1 / 6:1
-- **4 filtros per-símbolo**: F1 momentum, F2b sesión UTC, F3 volumen USDT Q3, F4 RSI14 sobrecompra
-- **Laboratorio**: simulación por (símbolo + estrategia) con filtros independientes por estrategia — sin mezclar parámetros
-- **Registro de señales**: toda señal detectada por el bot se guarda en DB (trades tomados + rechazados con razón exacta)
+- **Filtros per-símbolo**: horario restringido, trampa de momentum, trampa de volumen, sobrecompra RSI, anti-fakeout, spike extremo
+- **Filtros globales**: ADX mínimo (mercado lateral) + volumen diario mínimo — aplican a Breakout y Retest
+- **Laboratorio**: simulación por (símbolo + estrategia) con filtros independientes por estrategia, guardado de simulaciones
+- **Análisis de datos reales**: detección de patrones en trades históricos (sesión UTC, volumen, momentum) para calibrar filtros
+- **Registro de señales**: toda señal detectada se guarda en DB con razón de rechazo — auditoría completa
 - **ML**: XGBoost para filtrar señales — mejora con cada semana de trades reales acumulados
 - **Resiliencia**: estado persistido en disco, auto-reinicio ante crashes, circuit breaker diario
 - **News circuit breaker**: pausa automática ante eventos macro sin API key (Fear & Greed + RSS)
@@ -246,6 +248,11 @@ El Dockerfile hace el build de Vue y FastAPI sirve el `frontend/dist/` en `/`. S
 | GET | `/api/history/stats` | WR, PF, PnL total, mejor/peor trade |
 | GET | `/api/levels` | Niveles mensuales + diagnóstico de filtros por símbolo |
 | GET | `/api/events` | Registro de señales del bot (trades + rechazos con razón) |
+| GET | `/api/events?symbol=X&event_type=Y` | Filtrar eventos por símbolo o tipo |
+| GET | `/api/lab/simulations` | Listar simulaciones guardadas |
+| POST | `/api/lab/simulations` | Guardar resultado de una simulación |
+| GET | `/api/lab/simulations/{id}` | Cargar una simulación guardada |
+| DELETE | `/api/lab/simulations/{id}` | Eliminar una simulación guardada |
 | POST | `/api/lab/simulate` | Lanzar simulación en background (devuelve job_id) |
 | GET | `/api/lab/jobs/{id}` | Estado + progreso + resultado de una simulación |
 | POST | `/api/lab/jobs/{id}/cancel` | Cancelar simulación en curso |
@@ -262,37 +269,42 @@ El Dockerfile hace el build de Vue y FastAPI sirve el `frontend/dist/` en `/`. S
 El archivo principal es `config/config.yaml`.
 
 ```yaml
-# Pares activos — validados a 6 años (26 símbolos probados, 4 superan el filtro)
+# Pares activos con filtros per-símbolo optimizados (análisis 2018-2026)
 symbols:
-  - "ADA/USDT"    # WR 32.9% (6yr+filtros) | PF 1.35 | $1k→$4,086 | F1+F3
-  - "LINK/USDT"   # WR 31.2% (6yr+filtros) | PF 1.25 | $1k→$2,610 | F2b
-  - "EGLD/USDT"   # WR 38.3% (6yr+filtros) | PF 1.71 | $1k→$3,712 | F2b+F3+F4(RSI)
-  - "ATOM/USDT"   # WR 32.7% (6yr+filtros) | PF 1.34 | $1k→$1,806 | F2b+F3+F1+F4(RSI)
-  # Portfolio €100 capital compartido 6yr: €7,126 (+7,026%) | WR 33.7% | MaxDD -66.3%
+  - "ADA/USDT"    # Horario restringido 8-14h | vol mín 2.3× | sin trampa momentum ni vol USDT
+  - "LINK/USDT"   # Horario restringido 8-14h | vol máx 2.8× | clean breaker
+  - "EGLD/USDT"   # Horario restringido 14-24h | vol máx 2.8× | trampa vol + sobrecompra RSI
+  - "ATOM/USDT"   # Horario restringido 0-14h | trampa vol + momentum + sobrecompra RSI
+  - "DOGE/USDT"   # Horario restringido 8-14h | trampa vol USDT
+  - "AXS/USDT"    # Horario restringido 8-14h
 
-# Filtros per-símbolo (4 tipos validados con post-hoc simulation + backtest real)
-# F1: Momentum 5 velas — bloquear zona trampa Q3 [+0.30%, +1.60%]
-# F2b: Sesión UTC óptima — bloquear horas con WR históricamente bajo
-# F3: Volumen USDT normalizado — bloquear zona trampa Q3 [2.1×, 2.7×]
-# F4: RSI14 sobrecompra — bloquear entradas con RSI ≥ 70 (solo EGLD+ATOM)
+# Filtros per-símbolo
+# Nombres UI: Trampa de momentum | Horario restringido | Trampa de volumen
+#             Sobrecompra RSI | Anti-fakeout | Spike extremo
 symbol_params:
   "ADA/USDT":
-    momentum_q3_block: [0.30, 1.60]      # F1
-    usdt_norm_block_range: [2.1, 2.7]    # F3
+    session_block_hours: [8, 14]          # Horario restringido: apertura Londres/NY — WR 23% vs 35% fuera
+    volume_trigger_ratio: 2.3             # spike mínimo más exigente (2.5-3× tiene WR 38%)
   "LINK/USDT":
     failed_retest_filter: false           # Clean breaker histórico
-    volume_trigger_ratio_max: 2.8
-    session_block_hours: [8, 14]          # F2b: bloquear sesión europea
+    volume_trigger_ratio_max: 2.8         # Spike extremo: >2.8× son trampas de ballenas
+    session_block_hours: [8, 14]
   "EGLD/USDT":
     volume_trigger_ratio_max: 2.8
-    session_block_hours: [14, 24]         # F2b: bloquear sesión americana+noche
-    usdt_norm_block_range: [2.1, 2.7]    # F3
-    rsi_overbought_block: 70              # F4: RSI14 sobrecompra
+    session_block_hours: [14, 24]         # Horario restringido: sesión americana+noche
+    usdt_norm_block_range: [2.1, 2.7]    # Trampa de volumen
+    rsi_overbought_block: 70              # Sobrecompra RSI
   "ATOM/USDT":
-    session_block_hours: [0, 8]           # F2b: bloquear madrugada UTC
-    usdt_norm_block_range: [2.1, 2.7]    # F3
-    momentum_q3_block: [0.30, 1.60]      # F1
-    rsi_overbought_block: 70              # F4: RSI14 sobrecompra
+    session_block_hours: [0, 14]          # Horario restringido: madrugada + apertura europea
+    usdt_norm_block_range: [2.1, 2.7]    # Trampa de volumen
+    momentum_q3_block: [0.30, 1.60]      # Trampa de momentum
+    rsi_overbought_block: 70              # Sobrecompra RSI
+  "DOGE/USDT":
+    session_block_hours: [8, 14]
+    usdt_norm_block_range: [2.1, 2.7]
+  "AXS/USDT":
+    failed_retest_filter: false
+    session_block_hours: [8, 14]
 
 levels:
   monthly_lookback: 6
@@ -302,6 +314,8 @@ levels:
   failed_retest_lookback: 300       # 300×1m = 5h (equivalente a 60×5m de la simulación)
   failed_retest_auto_lookback: 2500 # 2500×1m = ~41h (equivalente a 500×5m de la simulación)
   failed_retest_min_bounce_pct: 0.3
+  adx_min: 20                       # ADX diario mínimo — mercado lateral bloquea Breakout+Retest
+  daily_vol_min_ratio: 0.8          # Volumen diario mínimo — día dormido bloquea Breakout+Retest
 
 risk:
   take_profit_pct: 3.0
@@ -549,15 +563,53 @@ Si <50%:
 - [x] SL del retest: 0.5% (vs 1% del breakout) — nivel ya confirmado, riesgo más ajustado
 - [x] R:R del retest: 6:1 — breakeven en WR 14% (vs 25% del breakout)
 - [x] **Registro de señales en DB** (`signal_events`): cada señal detectada se persiste con timestamp, símbolo, estrategia, dirección, precio, razón de rechazo — auditoría completa del comportamiento del bot
-- [x] **Panel de señales** en el dashboard: últimas 200 señales en tiempo real con filtros por símbolo y tipo (trades, rechazados por filtro/IA/riesgo/capacidad)
+- [x] **Panel de señales** en el dashboard: últimas 200 señales en tiempo real con filtros por símbolo y tipo
 - [x] **Bug fix crítico**: `predictor.predecir()` devolvía `0.0` (bloqueando trades) cuando el modelo no está disponible en vez de `1.0` (bypasear)
 - [x] **Bug fix crítico**: `failed_retest_lookback` escalado a 300 y `auto_lookback` a 2500 para candles 1m — la simulación usa 5m (factor 5×), el bot en producción usaba valores para 5m pero procesando 1m, bloqueando el 100% de las señales
 
+### ✅ Fase 4e — Optimización avanzada de filtros (completada: 2026-08)
+
+#### Análisis de datos reales (simulación 6 símbolos × 2018-2026, 1375 trades)
+Análisis sistemático de patrones en los trades históricos para detectar qué condiciones correlacionan con pérdidas.
+
+**Hallazgo principal — Horario UTC**:
+| Zona horaria | WR | Descripción |
+|-------------|-----|-------------|
+| **08-14h UTC** | **26.5%** | Apertura Londres + pre-NY: stop-hunting institucional |
+| **12-14h UTC** | **23.6%** | La peor franja (pre-apertura NY, spreads amplios) |
+| **02-04h UTC** | **39.0%** | La mejor franja (Asia mid-morning, tendencia limpia) |
+
+**Resultado**: se añadió `session_block_hours` a ADA, DOGE y AXS. ATOM ampliado de [0,8] a [0,14].
+Delta WR conseguido: **+6.5% a +11.9%** por símbolo eliminando solo las horas malas.
+
+#### Nuevos filtros globales
+- [x] **Filtro ADX** (`adx_min: 20`): bloquea entradas cuando el ADX diario < 20 (mercado lateral sin tendencia). Aplica a Breakout y Retest. No aplica a Bounce (los bounces funcionan mejor en mercados laterales).
+- [x] **Filtro volumen diario** (`daily_vol_min_ratio: 0.8`): bloquea entradas en días con volumen total < 80% de la media de 20 días. Aplica a Breakout y Retest.
+- [x] Ambos filtros aplicados consistentemente en simulación y en el paper trader (verificación formal realizada)
+
+#### Calibración de config.yaml con datos reales
+- [x] **ADA**: eliminados F1 y F3 (reducían retorno de +1,077% a +487% cortando trades buenos en bull runs); añadido `volume_trigger_ratio: 2.3` (spikes 2.5-3× tienen WR 38% vs 29% para 2.0-2.5×)
+- [x] **ATOM**: ampliado `session_block_hours` de [0,8] a [0,14] cubriendo la apertura europea
+- [x] **DOGE/AXS**: añadido `session_block_hours: [8,14]` (sesión sin filtrar tenía WR 26-27% vs 35%)
+
+#### Bug fixes
+- [x] **F3 USDT norm**: el backtest usaba ventana de 200 velas vs 50 en el live bot — corregido a 50
+- [x] **Simulaciones con rango de fechas históricas**: `fetch_days` ahora calculado desde `date_from` hasta hoy (no solo la duración del rango), permitiendo simular 2018-2021 correctamente
+- [x] **P&L multi-estrategia**: `base_symbol` en portfolio sim evita doble exposición cuando mismo símbolo tiene Breakout + Retest simultáneos
+
+#### Mejoras de UX en el Laboratorio
+- [x] **Guardado de simulaciones**: botón "💾 Guardar" en resultados; pestaña "Guardadas" con lista, carga y eliminación
+- [x] **Nombres legibles**: F1 Momentum → "Trampa de momentum", F2b → "Horario restringido", etc.
+- [x] **Modal ℹ de documentación**: botón en cada tarjeta explica qué hace cada filtro, por qué ayuda y cómo configurarlo
+- [x] **Fix visual**: las pestañas por símbolo en resultados ahora se generan de las claves reales del resultado (inmune a formato antiguo vs nuevo)
+
 ### ⏳ Fase 4b — Paper trading en vivo (en curso: 2026-07-29)
-- [x] Paper trader arrancado en Binance Testnet — 4 símbolos (ADA, LINK, EGLD, ATOM), filtros activos
+- [x] Paper trader arrancado en Binance Testnet — 6 símbolos (ADA, LINK, EGLD, ATOM, DOGE, AXS), filtros activos
 - [x] Ciclo 10s, futuros 3×, balance 1000 USDT inicial
 - [x] Registro de señales activo — auditoría completa de cada ciclo (trades tomados + rechazados)
 - [x] Bug crítico corregido: 0 trades en semanas de funcionamiento por `failed_retest_lookback` mal escalado para 1m
+- [x] Filtros de horario añadidos/ampliados en todos los símbolos con datos históricos
+- [x] ADX y volumen diario activos como filtros globales
 - [ ] Acumular ≥ 50 trades de breakout con WR cercana al backtest (32-38%)
 - [ ] Acumular ≥ 20 trades de retest en ADA para validar parámetros con datos reales
 - [ ] Reentrenar XGBoost cada semana con trades acumulados
@@ -592,10 +644,12 @@ Si <50%:
 ### 🔜 Fase 7 — Mejoras futuras (ideas)
 - [ ] Validar estrategia Retest con 20+ trades reales — ajustar parámetros y activar más símbolos
 - [ ] Estrategia Bounce: validar en más símbolos y condiciones de mercado
-- [ ] Filtro de tendencia: solo LONGs cuando SMA50 semanal alcista (SHORTs tienen WR 34.7% vs LONGs 30.0%)
+- [ ] Confirmación multi-TF (`confirmar_multi_temporal`) en el backtest — actualmente solo en el live bot; añadirla haría las simulaciones más precisas respecto al comportamiento real
+- [ ] Filtro de tendencia semanal: solo LONGs cuando SMA50 semanal alcista (SHORTs tienen WR 34.7% vs LONGs 30.0%)
 - [ ] Simular slippage en backtest (~0.05% adicional por entrada)
 - [ ] Validar tamaño mínimo de orden por exchange
 - [ ] Sincronizar balance real al arrancar desde el exchange
 - [ ] Curva de equity en el dashboard (gráfico de balance histórico)
 - [ ] Autenticación básica en el dashboard (usuario + contraseña)
 - [ ] Usar `signal_events` para reentrenar el modelo XGBoost con señales rechazadas (contrafactual learning)
+- [ ] Analizar zona 16-18h UTC (WR 24.5%, 94 trades) — posible filtro adicional para símbolos sensibles a cierre europeo

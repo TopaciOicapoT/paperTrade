@@ -70,16 +70,18 @@ def simular_trades(
     volume_ratio_min: float = 2.0,
     volume_ratio_max: float = 3.0,
     fee_pct: float = 0.1,
-    ml_threshold: float = 0.0,       # 0.0 = sin filtro ML; >0 activa el modelo
-    volatility_filter: bool = False,  # Si True, salta días con spike de volatilidad anormal
-    volatility_sigma: float = 3.0,    # Umbral de desviaciones estándar para considerar un día "anormal"
-    volatility_window: int = 20,      # Ventana (días) para calcular la volatilidad media/std
-    leverage: int = 1,                # 1 = spot; >1 = futuros con apalancamiento
-    initial_capital: float = 1000.0,  # Capital inicial para curva en dólares
-    failed_retest_filter: bool = True,  # False = desactiva filtro para comparar baseline
-    symbol_params: dict | None = None,  # Overrides por símbolo desde config["symbol_params"]
-    rsi_overbought_block: float | None = None,  # Bloquea entradas con RSI14 ≥ umbral (ej. 70)
-    trend_filter: bool = False,  # Solo LONGs en tendencia alcista (SMA50w > SMA200w) y viceversa
+    ml_threshold: float = 0.0,
+    volatility_filter: bool = False,
+    volatility_sigma: float = 3.0,
+    volatility_window: int = 20,
+    leverage: int = 1,
+    initial_capital: float = 1000.0,
+    failed_retest_filter: bool = True,
+    symbol_params: dict | None = None,
+    rsi_overbought_block: float | None = None,
+    trend_filter: bool = False,
+    _adx_min: float = 0,               # umbral ADX; 0 = desactivado
+    _daily_vol_min: float = 0.0,       # ratio vol diario mínimo; 0 = desactivado
 ) -> BacktestResult:
     """
     Simula la estrategia de breakout mensual sobre datos históricos.
@@ -160,18 +162,28 @@ def simular_trades(
     logger.info(f"Niveles pre-calculados para {len(daily_levels_cache)} días")
 
     # ── Pre-calcular tendencia semanal (SMA50 vs SMA200) ──
-    # True = alcista (SMA50 > SMA200), False = bajista, NaN = sin datos suficientes
-    # Usamos .asof() en el bucle para obtener el valor vigente en cada vela 5m.
     trend_series: pd.Series | None = None
     if trend_filter and df_weekly is not None and len(df_weekly) >= 50:
         sma50  = df_weekly["close"].rolling(50).mean()
         sma200 = df_weekly["close"].rolling(200).mean()
-        trend_series = (sma50 > sma200)   # True = tendencia alcista semanal
+        trend_series = (sma50 > sma200)
         n_bull = trend_series.sum()
         logger.info(
             f"[TrendFilter] SMA50w > SMA200w en {n_bull}/{len(trend_series)} semanas "
             f"({n_bull/len(trend_series)*100:.0f}% alcista)"
         )
+
+    # ── Pre-calcular ADX diario y ratio de volumen diario ──
+    adx_min       = sym_ov.get("adx_min", _adx_min)
+    daily_vol_min = sym_ov.get("daily_vol_min_ratio", _daily_vol_min)
+    adx_series_daily: pd.Series | None = None
+    daily_vol_ratio: pd.Series | None = None
+    if adx_min > 0 and df_daily is not None and len(df_daily) >= 30:
+        from indicators.technical import calcular_adx_series
+        adx_series_daily = calcular_adx_series(df_daily)
+        logger.info(f"[ADX] Pre-calculado | umbral mínimo: {adx_min}")
+    if daily_vol_min > 0 and df_daily is not None and len(df_daily) >= 21:
+        daily_vol_ratio = df_daily["volume"] / df_daily["volume"].rolling(20).mean().shift(1)
 
     # ── Pre-calcular días de alta volatilidad (proxy de noticias) ──
     # Un día es "caliente" si su rango (high-low)/low supera la media + N*std
@@ -250,23 +262,31 @@ def simular_trades(
         direction = "long" if monthly.broke_resistance else "short"
 
         # ── Filtro de tendencia semanal (SMA50w vs SMA200w) ──
-        # LONGs solo en mercado alcista; SHORTs solo en bajista.
-        # Evita operar en contra de la tendencia macro (ej. LONGs en bear 2018-2020).
         if trend_series is not None:
             trend_val = trend_series.asof(df_entry.index[i])
             if pd.isna(trend_val):
                 continue
             if direction == "long"  and not trend_val:
-                continue   # bajista — no entrar largo
+                continue
             if direction == "short" and trend_val:
-                continue   # alcista — no entrar corto
+                continue
 
-        # En spot no se puede operar en corto (sin margen/préstamo).
-        # Solo futuros (leverage > 1) puede tomar SHORTs.
         if direction == "short" and leverage == 1:
             continue
 
         monthly_level = monthly.resistance if direction == "long" else monthly.support
+
+        # ── Filtro ADX — mercado lateral (ADX < umbral) ──────────────────────
+        if adx_series_daily is not None and adx_min > 0:
+            adx_val = adx_series_daily.asof(df_entry.index[i])
+            if pd.isna(adx_val) or float(adx_val) < adx_min:
+                continue
+
+        # ── Filtro volumen diario — mercado dormido ───────────────────────────
+        if daily_vol_ratio is not None and daily_vol_min > 0:
+            dvr = daily_vol_ratio.asof(df_entry.index[i])
+            if not pd.isna(dvr) and float(dvr) < daily_vol_min:
+                continue
 
         # Failed retest — tres modos: "auto" | True | False
         if fr_setting is False:
@@ -319,7 +339,8 @@ def simular_trades(
         if usdt_block:
             lo_v, hi_v = usdt_block
             usdt_vol  = float(current["volume"]) * float(current["close"])
-            usdt_mean = (window_entry["volume"] * window_entry["close"]).mean()
+            # Usar las últimas 50 velas como referencia (= 250min en 5m) — igual que el live bot
+            usdt_mean = (window_entry["volume"] * window_entry["close"]).iloc[-50:].mean()
             usdt_norm_val = usdt_vol / usdt_mean if usdt_mean > 0 else 1.0
             if lo_v <= usdt_norm_val <= hi_v:
                 continue
@@ -797,15 +818,19 @@ def simular_trades_retest(
     retest_min_move_pct: float = 0.5,
     retest_tolerance_pct: float = 0.35,
     retest_pullback_vol_max: float = 1.5,
-    symbol_params: dict | None = None,   # sobreescribe los parámetros por símbolo
+    symbol_params: dict | None = None,
+    _adx_min: float = 0,
+    _daily_vol_min: float = 0.0,
 ) -> "BacktestResult":
     """Entrada en pullback/retest post-breakout. Parámetros sobreescribibles por símbolo."""
-    # Aplicar overrides de symbol_params si existen
     sp = (symbol_params or {}).get(symbol, {})
     if sp:
         retest_min_move_pct   = sp.get("retest_min_move_pct",   retest_min_move_pct)
         retest_tolerance_pct  = sp.get("retest_tolerance_pct",  retest_tolerance_pct)
         retest_pullback_vol_max = sp.get("retest_pullback_vol_max", retest_pullback_vol_max)
+
+    adx_min       = sp.get("adx_min", _adx_min)
+    daily_vol_min = sp.get("daily_vol_min_ratio", _daily_vol_min)
 
     logger.disable("indicators.levels")
 
@@ -814,7 +839,7 @@ def simular_trades_retest(
     open_trade: Trade | None = None
     lookback_days = monthly_lookback * 30
 
-    # ── Pre-calcular niveles por día (igual que en simular_trades) ──
+    # ── Pre-calcular niveles por día ──
     daily_levels_cache: dict = {}
     for idx in range(lookback_days, len(df_daily) - 1):
         daily_window = df_daily.iloc[idx - lookback_days: idx + 1]
@@ -828,9 +853,17 @@ def simular_trades_retest(
     logger.enable("indicators.levels")
     logger.info(f"[Retest] Niveles pre-calculados para {len(daily_levels_cache)} días")
 
-    COOLDOWN_BARS = 288  # 24h a 5m/vela — evita re-entrar en el mismo retest
+    # ── Pre-calcular ADX y volumen diario (mismo criterio que breakout) ──
+    adx_series_rt: pd.Series | None = None
+    daily_vol_rt: pd.Series | None = None
+    if adx_min > 0 and len(df_daily) >= 30:
+        from indicators.technical import calcular_adx_series
+        adx_series_rt = calcular_adx_series(df_daily)
+    if daily_vol_min > 0 and len(df_daily) >= 21:
+        daily_vol_rt = df_daily["volume"] / df_daily["volume"].rolling(20).mean().shift(1)
 
-    last_retest_bar: dict[str, int] = {}  # nivel_key → índice de la última entrada
+    COOLDOWN_BARS = 288
+    last_retest_bar: dict[str, int] = {}
 
     for i in range(retest_lookback + 50, len(df_entry) - 1):
         current = df_entry.iloc[i]
@@ -871,6 +904,16 @@ def simular_trades_retest(
         monthly = daily_levels_cache.get(current_date)
         if monthly is None:
             continue
+
+        # ADX y volumen diario (misma lógica que breakout — mercado lateral = retest no fiable)
+        if adx_series_rt is not None and adx_min > 0:
+            adx_v = adx_series_rt.asof(df_entry.index[i])
+            if pd.isna(adx_v) or float(adx_v) < adx_min:
+                continue
+        if daily_vol_rt is not None and daily_vol_min > 0:
+            dvr = daily_vol_rt.asof(df_entry.index[i])
+            if not pd.isna(dvr) and float(dvr) < daily_vol_min:
+                continue
 
         current_price = float(current["close"])
         vol_mean = float(df_entry["volume"].iloc[max(0, i-50):i].mean()) or 1.0

@@ -8,10 +8,13 @@ GET  /api/lab/jobs/{job_id}  → estado + progreso + resultado cuando termina
 GET  /api/lab/symbols        → lista de símbolos disponibles con info de datos
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from api import lab_runner
+from api.db.database import get_db
+from api.db.models import SavedSimulation
 
 router = APIRouter(prefix="/api/lab", tags=["lab"])
 
@@ -153,3 +156,71 @@ def cancel_job(job_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Job no encontrado o ya terminado")
     return {"message": "Simulación cancelada."}
+
+
+# ── Simulaciones guardadas ────────────────────────────────────────────────────
+
+class SaveRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    result: dict  # resultado completo del job (sin_filtros, con_filtros, filter_analysis, params)
+
+
+@router.post("/simulations")
+def save_simulation(body: SaveRequest, db: Session = Depends(get_db)):
+    """Guarda el resultado de una simulación con un nombre dado por el usuario."""
+    import json
+    sim = SavedSimulation(
+        name=body.name.strip(),
+        params_json=json.dumps(body.result.get("params", {})),
+        result_json=json.dumps(body.result),
+    )
+    db.add(sim)
+    db.commit()
+    db.refresh(sim)
+    return {"id": sim.id, "name": sim.name, "created_at": sim.created_at.isoformat()}
+
+
+@router.get("/simulations")
+def list_simulations(db: Session = Depends(get_db)):
+    """Lista de simulaciones guardadas (sin el resultado completo, solo metadatos)."""
+    import json
+    rows = db.query(SavedSimulation).order_by(SavedSimulation.created_at.desc()).all()
+    result = []
+    for r in rows:
+        params = json.loads(r.params_json or "{}")
+        result.append({
+            "id":         r.id,
+            "name":       r.name,
+            "created_at": r.created_at.isoformat(),
+            "symbols":    params.get("symbols", []),
+            "capital":    params.get("capital"),
+            "leverage":   params.get("leverage"),
+            "actual_years": params.get("actual_years"),
+        })
+    return result
+
+
+@router.get("/simulations/{sim_id}")
+def get_simulation(sim_id: int, db: Session = Depends(get_db)):
+    """Devuelve el resultado completo de una simulación guardada."""
+    import json
+    sim = db.query(SavedSimulation).filter(SavedSimulation.id == sim_id).first()
+    if not sim:
+        raise HTTPException(status_code=404, detail="Simulación no encontrada")
+    return {
+        "id":         sim.id,
+        "name":       sim.name,
+        "created_at": sim.created_at.isoformat(),
+        "result":     json.loads(sim.result_json or "{}"),
+    }
+
+
+@router.delete("/simulations/{sim_id}")
+def delete_simulation(sim_id: int, db: Session = Depends(get_db)):
+    """Elimina una simulación guardada."""
+    sim = db.query(SavedSimulation).filter(SavedSimulation.id == sim_id).first()
+    if not sim:
+        raise HTTPException(status_code=404, detail="Simulación no encontrada")
+    db.delete(sim)
+    db.commit()
+    return {"message": "Eliminada."}

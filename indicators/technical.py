@@ -34,6 +34,13 @@ def calcular_volumen_relativo(df: pd.DataFrame, window: int = 20) -> pd.Series:
     return df["volume"] / df["volume"].rolling(window).mean()
 
 
+def calcular_adx_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ADX sobre df diario: mide fuerza de tendencia. >20 = tendencia, <20 = lateral."""
+    if len(df) < period * 2 + 1:
+        return pd.Series(dtype=float, index=df.index)
+    return ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=period).adx()
+
+
 def calcular_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula todas las features técnicas sobre un DataFrame OHLCV.

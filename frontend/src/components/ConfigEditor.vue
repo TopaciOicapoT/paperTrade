@@ -356,7 +356,7 @@ async function save() {
                 <div class="sfc-section-label">Filtros de calidad</div>
                 <label class="sfc-row">
                   <input type="checkbox" v-model="item.filters.f1.enabled" />
-                  <span class="sfc-fname">F1 Momentum</span>
+                  <span class="sfc-fname">Trampa de momentum</span>
                   <template v-if="item.filters.f1.enabled">
                     <input
                       class="sfc-num"
@@ -372,12 +372,13 @@ async function save() {
                     /><span class="sfc-unit">%</span>
                   </template>
                   <span v-else class="sfc-hint"
-                    >bloquea zona trampa de momentum 5 velas</span
+                    >evita la zona donde el precio acelera antes de
+                    revertir</span
                   >
                 </label>
                 <label class="sfc-row">
                   <input type="checkbox" v-model="item.filters.f2b.enabled" />
-                  <span class="sfc-fname">F2b Sesión UTC</span>
+                  <span class="sfc-fname">Horario restringido</span>
                   <template v-if="item.filters.f2b.enabled">
                     <input
                       class="sfc-num"
@@ -395,12 +396,12 @@ async function save() {
                     /><span class="sfc-unit">h UTC</span>
                   </template>
                   <span v-else class="sfc-hint"
-                    >bloquea franja horaria con WR bajo</span
+                    >apertura Londres/NY — WR 23-26% en esas horas</span
                   >
                 </label>
                 <label class="sfc-row">
                   <input type="checkbox" v-model="item.filters.f3.enabled" />
-                  <span class="sfc-fname">F3 Vol USDT</span>
+                  <span class="sfc-fname">Trampa de volumen</span>
                   <template v-if="item.filters.f3.enabled">
                     <input
                       class="sfc-num"
@@ -416,12 +417,12 @@ async function save() {
                     /><span class="sfc-unit">×</span>
                   </template>
                   <span v-else class="sfc-hint"
-                    >bloquea zona trampa de vol USDT normalizado</span
+                    >volumen intermedio 2.1-2.7× — zona de fakeouts</span
                   >
                 </label>
                 <label class="sfc-row">
                   <input type="checkbox" v-model="item.filters.f4.enabled" />
-                  <span class="sfc-fname">F4 RSI14 ≥</span>
+                  <span class="sfc-fname">Sobrecompra RSI ≥</span>
                   <template v-if="item.filters.f4.enabled">
                     <input
                       class="sfc-num"
@@ -432,20 +433,20 @@ async function save() {
                     /><span class="sfc-unit">(sobrecompra)</span>
                   </template>
                   <span v-else class="sfc-hint"
-                    >bloquea entradas con RSI en sobrecompra</span
+                    >RSI ≥ 70 → WR 25.9% vs 34.2% normal</span
                   >
                 </label>
                 <label class="sfc-row">
                   <input type="checkbox" v-model="item.filters.fr.enabled" />
-                  <span class="sfc-fname">Failed retest (auto)</span>
-                  <span class="sfc-hint">anti-fakeout adaptativo</span>
+                  <span class="sfc-fname">Anti-fakeout</span>
+                  <span class="sfc-hint">auto-calibrado por nivel</span>
                 </label>
                 <label class="sfc-row">
                   <input
                     type="checkbox"
                     v-model="item.filters.volmax.enabled"
                   />
-                  <span class="sfc-fname">Vol máximo ≤</span>
+                  <span class="sfc-fname">Spike extremo ≤</span>
                   <template v-if="item.filters.volmax.enabled">
                     <input
                       class="sfc-num"
@@ -464,7 +465,7 @@ async function save() {
               <template v-else-if="item.strategy === 'retest'">
                 <div class="sfc-section-label">Parámetros de retest</div>
                 <div class="retest-param">
-                  <span class="sfc-fname retest-label">Mov. mínimo</span>
+                  <span class="sfc-fname retest-label">Distancia mínima</span>
                   <input
                     class="sfc-num"
                     type="number"
@@ -474,7 +475,7 @@ async function save() {
                   <span class="sfc-unit">% (precio alejado del nivel)</span>
                 </div>
                 <div class="retest-param">
-                  <span class="sfc-fname retest-label">Tolerancia</span>
+                  <span class="sfc-fname retest-label">Proximidad máxima</span>
                   <input
                     class="sfc-num"
                     type="number"
@@ -484,7 +485,7 @@ async function save() {
                   <span class="sfc-unit">% (proximidad al nivel)</span>
                 </div>
                 <div class="retest-param">
-                  <span class="sfc-fname retest-label">Vol. pullback ≤</span>
+                  <span class="sfc-fname retest-label">Vol. pullback máx</span>
                   <input
                     class="sfc-num"
                     type="number"

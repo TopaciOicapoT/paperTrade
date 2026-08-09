@@ -547,7 +547,25 @@ def evaluar_estrategia(
             )
             return None
 
-    # 4. Triggers de otros traders disparándose (volumen spike)
+    # 4. ADX — evitar mercados laterales (ADX < umbral)
+    adx_min = levels_config.get("adx_min", 0)
+    if adx_min > 0 and df_diario is not None and len(df_diario) >= 30:
+        from indicators.technical import calcular_adx_series
+        adx_val = float(calcular_adx_series(df_diario).iloc[-1])
+        if adx_val < adx_min:
+            logger.debug(f"{symbol} | ADX {adx_val:.1f} < {adx_min} — mercado lateral")
+            return None
+
+    # 4b. Volumen diario — evitar días dormidos (vol < ratio × media 20d)
+    daily_vol_min = levels_config.get("daily_vol_min_ratio", 0.0)
+    if daily_vol_min > 0 and df_diario is not None and len(df_diario) >= 21:
+        vol_mean  = float(df_diario["volume"].iloc[-21:-1].mean())
+        vol_today = float(df_diario["volume"].iloc[-1])
+        if vol_mean > 0 and vol_today / vol_mean < daily_vol_min:
+            logger.debug(f"{symbol} | Vol diario {vol_today/vol_mean:.2f}× < {daily_vol_min}× — mercado dormido")
+            return None
+
+    # 5. Triggers de otros traders disparándose (volumen spike)
     hay_spike, volume_ratio = detectar_triggers_disparandose(
         df_entry,
         volume_ratio_min=levels_config.get("volume_trigger_ratio", 2.0),
@@ -810,6 +828,23 @@ def evaluar_retest_signal(
 
     levels_cfg = config.get("levels", {})
     monthly_lookback = levels_cfg.get("monthly_lookback", 6)
+
+    # ADX y volumen diario aplican igual que en breakout: mercado lateral = retest no fiable
+    adx_min = levels_cfg.get("adx_min", 0)
+    if adx_min > 0 and df_diario is not None and len(df_diario) >= 30:
+        from indicators.technical import calcular_adx_series
+        adx_val = float(calcular_adx_series(df_diario).iloc[-1])
+        if adx_val < adx_min:
+            logger.debug(f"{symbol} | [Retest] ADX {adx_val:.1f} < {adx_min} — mercado lateral")
+            return None
+
+    daily_vol_min = levels_cfg.get("daily_vol_min_ratio", 0.0)
+    if daily_vol_min > 0 and df_diario is not None and len(df_diario) >= 21:
+        vol_mean_d = float(df_diario["volume"].iloc[-21:-1].mean())
+        vol_today  = float(df_diario["volume"].iloc[-1])
+        if vol_mean_d > 0 and vol_today / vol_mean_d < daily_vol_min:
+            logger.debug(f"{symbol} | [Retest] Vol diario bajo — mercado dormido")
+            return None
 
     try:
         monthly = calcular_niveles_mensuales(df_diario, lookback_months=monthly_lookback)

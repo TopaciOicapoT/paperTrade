@@ -9,13 +9,15 @@ guardrails:
   max_daily_loss_pct: 3.0
   max_drawdown_pct: 15.0
 levels:
+  adx_min: 20
+  daily_vol_min_ratio: 0.8
   approach_pct: 0.3
   bounce_min_range_pct: 2.0
   bounce_wick_min_pct: 0.1
   daily_lookback: 20
-  failed_retest_auto_lookback: 2500  # 2500×1m = ~41h (equiv. a 500×5m de la simulación)
+  failed_retest_auto_lookback: 2500
   failed_retest_filter: auto
-  failed_retest_lookback: 300  # 300×1m = 5h (equiv. a 60×5m de la simulación)
+  failed_retest_lookback: 300
   failed_retest_min_bounce_pct: 0.3
   hourly_lookback: 48
   monthly_lookback: 6
@@ -44,19 +46,15 @@ strategies:
 - breakout
 symbol_params:
   ADA/USDT:
-    momentum_q3_block:
-    - 0.3
-    - 1.6
     retest_min_move_pct: 0.5
     retest_pullback_vol_max: 1.5
     retest_tolerance_pct: 0.35
+    session_block_hours:
+    - 8
+    - 14
     strategies:
     - breakout
-    - retest
-    - bounce
-    usdt_norm_block_range:
-    - 2.1
-    - 2.7
+    volume_trigger_ratio: 2.3
   ATOM/USDT:
     momentum_q3_block:
     - 0.3
@@ -67,30 +65,31 @@ symbol_params:
     rsi_overbought_block: 70
     session_block_hours:
     - 0
-    - 8
+    - 14
     strategies:
     - breakout
-    - retest
-    - bounce
     usdt_norm_block_range:
     - 2.1
     - 2.7
   AXS/USDT:
+    failed_retest_filter: false
     retest_min_move_pct: 0.5
     retest_pullback_vol_max: 1.5
     retest_tolerance_pct: 0.35
+    session_block_hours:
+    - 8
+    - 14
     strategies:
     - breakout
-    - retest
-    - bounce
   DOGE/USDT:
     retest_min_move_pct: 0.5
     retest_pullback_vol_max: 1.5
     retest_tolerance_pct: 0.35
+    session_block_hours:
+    - 8
+    - 14
     strategies:
     - breakout
-    - retest
-    - bounce
     usdt_norm_block_range:
     - 2.1
     - 2.7
@@ -104,8 +103,6 @@ symbol_params:
     - 24
     strategies:
     - breakout
-    - retest
-    - bounce
     usdt_norm_block_range:
     - 2.1
     - 2.7
@@ -120,8 +117,6 @@ symbol_params:
     - 14
     strategies:
     - breakout
-    - retest
-    - bounce
     volume_trigger_ratio_max: 2.8
 symbols:
 - ADA/USDT

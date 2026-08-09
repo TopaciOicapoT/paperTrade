@@ -139,10 +139,11 @@ def start_simulation(
                 strategy_entries=strategy_entries,
             )
 
-            # La lista de entry_keys para result.params.symbols viene del resultado real
-            result_syms = list(dict.fromkeys(
-                s["symbol"] for s in (con.get("por_simbolo") or [])
-            )) if con.get("por_simbolo") else symbols
+            # Derivare result_syms dalle chiavi reali: prima con, poi sin, poi fallback
+            _por_con = con.get("por_simbolo") or []
+            _por_sin = sin.get("por_simbolo") or []
+            _por_any = _por_con if _por_con else _por_sin
+            result_syms = list(dict.fromkeys(s["symbol"] for s in _por_any)) if _por_any else symbols
 
             _set_done(job_id, {
                 "params": {
