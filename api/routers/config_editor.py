@@ -33,12 +33,13 @@ class ConfigPatch(BaseModel):
     max_open_positions: int | None = Field(None, ge=1, le=10)
     leverage:          int | None = Field(None, ge=1, le=20)
     symbol_params:     dict[str, dict[str, Any]] | None = None
+    levels:            dict[str, Any] | None = None  # overrides para config["levels"]
 
 
 @router.get("")
 def get_config(request: Request):
-    """Devuelve la config relevante para el panel de control."""
     cfg = request.app.state.trader.config
+    lvl = cfg.get("levels", {})
     return {
         "symbols":           cfg.get("symbols", []),
         "max_open_positions": cfg["risk"]["max_open_positions"],
@@ -46,10 +47,18 @@ def get_config(request: Request):
         "futures_enabled":   cfg.get("futures", {}).get("enabled", False),
         "take_profit_pct":   cfg["risk"]["take_profit_pct"],
         "sl_behind_level_pct": cfg["risk"]["sl_behind_level_pct"],
-        "volume_trigger_ratio":     cfg["levels"]["volume_trigger_ratio"],
-        "volume_trigger_ratio_max": cfg["levels"].get("volume_trigger_ratio_max", 3.0),
-        "failed_retest_filter":     cfg["levels"]["failed_retest_filter"],
+        "volume_trigger_ratio":     lvl.get("volume_trigger_ratio", 2.0),
+        "volume_trigger_ratio_max": lvl.get("volume_trigger_ratio_max", 3.0),
+        "failed_retest_filter":     lvl.get("failed_retest_filter", "auto"),
         "symbol_params":     cfg.get("symbol_params", {}),
+        "levels": {
+            "adx_min":                     lvl.get("adx_min", 0),
+            "daily_vol_min_ratio":         lvl.get("daily_vol_min_ratio", 0.0),
+            "crypto_trend_filter":         lvl.get("crypto_trend_filter", False),
+            "crypto_trend_slope_window":   lvl.get("crypto_trend_slope_window", 7),
+            "crypto_trend_min_slope":      lvl.get("crypto_trend_min_slope", 1.10),
+            "crypto_trend_min_absolute":   lvl.get("crypto_trend_min_absolute", 25.0),
+        },
     }
 
 
@@ -82,6 +91,10 @@ def patch_config(body: ConfigPatch, request: Request):
             cfg.get("symbol_params", {}), body.symbol_params
         )
         changed.append("symbol_params")
+
+    if body.levels is not None:
+        cfg.setdefault("levels", {}).update(body.levels)
+        changed.append("levels")
 
     if not changed:
         raise HTTPException(status_code=400, detail="Sin cambios que aplicar")

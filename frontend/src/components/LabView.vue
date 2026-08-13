@@ -14,9 +14,20 @@ const capital = ref(100);
 const maxPositions = ref(3);
 const years = ref(10);
 const leverage = ref(3);
+const includeFilterAnalysis = ref(false); // OFF por defecto — la pasada de filtros es muy lenta
 const periodMode = ref("years"); // "years" | "range"
 const dateFrom = ref("");
 const dateTo = ref("");
+
+// Filtros globales de mercado (inicializados desde el config del bot)
+const globalFilters = ref({
+  daily_vol_enabled: false,
+  daily_vol_ratio: 0.8,
+  crypto_trend: false,
+  crypto_slope_window: 7,
+  crypto_min_slope: 1.1,
+  crypto_min_absolute: 25.0,
+});
 
 // Símbolos únicos para el selector (filtra los ya añadidos con esa estrategia)
 const selected = computed(() => [
@@ -138,6 +149,15 @@ async function loadSymbols() {
   const symData = await symRes.json();
   botConfig.value = await cfgRes.json();
   availableSymbols.value = symData.available ?? [];
+  // Inicializar filtros globales desde config del bot
+  const lvl = botConfig.value?.levels ?? {};
+  globalFilters.value.daily_vol_enabled = (lvl.daily_vol_min_ratio ?? 0) > 0;
+  globalFilters.value.daily_vol_ratio = lvl.daily_vol_min_ratio ?? 0.8;
+  globalFilters.value.crypto_trend = lvl.crypto_trend_filter ?? false;
+  globalFilters.value.crypto_slope_window = lvl.crypto_trend_slope_window ?? 7;
+  globalFilters.value.crypto_min_slope = lvl.crypto_trend_min_slope ?? 1.1;
+  globalFilters.value.crypto_min_absolute =
+    lvl.crypto_trend_min_absolute ?? 25.0;
   // Pre-seleccionar los símbolos activos del bot con sus filtros configurados
   for (const sym of symData.active_symbols ?? []) {
     const sp = botConfig.value?.symbol_params?.[sym] ?? {};
@@ -227,6 +247,16 @@ async function simulate() {
       years: periodMode.value === "years" ? years.value : 1,
       leverage: leverage.value,
       strategy_entries: stratEntries,
+      include_filter_analysis: includeFilterAnalysis.value,
+      levels_override: {
+        daily_vol_min_ratio: globalFilters.value.daily_vol_enabled
+          ? globalFilters.value.daily_vol_ratio
+          : 0,
+        crypto_trend_filter: globalFilters.value.crypto_trend,
+        crypto_trend_slope_window: globalFilters.value.crypto_slope_window,
+        crypto_trend_min_slope: globalFilters.value.crypto_min_slope,
+        crypto_trend_min_absolute: globalFilters.value.crypto_min_absolute,
+      },
       date_from: periodMode.value === "range" ? dateFrom.value || null : null,
       date_to: periodMode.value === "range" ? dateTo.value || null : null,
     }),
@@ -956,6 +986,76 @@ function fmtSavedDate(iso) {
             <input v-model.number="leverage" type="number" min="1" max="10" />
           </div>
 
+          <!-- ── Condiciones de mercado ── -->
+          <div class="field field-full">
+            <label class="mkt-label">
+              Condiciones de mercado
+              <span class="mkt-hint"
+                >filtros globales aplicados a Breakout y Retest</span
+              >
+            </label>
+            <div class="mkt-filters">
+              <label class="mkt-row">
+                <input
+                  type="checkbox"
+                  v-model="globalFilters.daily_vol_enabled"
+                />
+                <span class="mkt-fname">Vol. diario mínimo</span>
+                <template v-if="globalFilters.daily_vol_enabled">
+                  <input
+                    class="sfc-num"
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    v-model.number="globalFilters.daily_vol_ratio"
+                  />
+                  <span class="sfc-unit">× media 20d</span>
+                </template>
+                <span v-else class="sfc-hint"
+                  >descarta días con mercado dormido</span
+                >
+              </label>
+              <label class="mkt-row">
+                <input type="checkbox" v-model="globalFilters.crypto_trend" />
+                <span class="mkt-fname">Tendencia cripto</span>
+                <span class="sfc-hint">ADX subiendo o establecido</span>
+              </label>
+              <template v-if="globalFilters.crypto_trend">
+                <div class="mkt-sub">
+                  <span class="mkt-sub-label">Ventana</span>
+                  <input
+                    class="sfc-num"
+                    type="number"
+                    min="3"
+                    max="30"
+                    v-model.number="globalFilters.crypto_slope_window"
+                  />
+                  <span class="sfc-unit">días</span>
+                  <span class="mkt-sub-label" style="margin-left: 0.6rem"
+                    >Pendiente mín.</span
+                  >
+                  <input
+                    class="sfc-num"
+                    type="number"
+                    step="0.05"
+                    v-model.number="globalFilters.crypto_min_slope"
+                  />
+                  <span class="sfc-unit">×</span>
+                  <span class="mkt-sub-label" style="margin-left: 0.6rem"
+                    >ADX mín.</span
+                  >
+                  <input
+                    class="sfc-num"
+                    type="number"
+                    step="1"
+                    v-model.number="globalFilters.crypto_min_absolute"
+                  />
+                </div>
+              </template>
+            </div>
+          </div>
+
           <div class="field field-full btn-row">
             <button
               class="btn-simulate"
@@ -971,6 +1071,13 @@ function fmtSavedDate(iso) {
             >
               ✕ Cancelar
             </button>
+            <label class="filter-analysis-toggle">
+              <input type="checkbox" v-model="includeFilterAnalysis" />
+              <span>Analizar impacto de filtros</span>
+              <span class="fa-warn" v-if="includeFilterAnalysis"
+                >⚠ lento (+20-30 min)</span
+              >
+            </label>
           </div>
         </div> </template
       ><!-- fin v-if="!isSavedView" -->
@@ -1002,8 +1109,8 @@ function fmtSavedDate(iso) {
             <span class="prog-pass-badge">{{ item.pass }}/2</span>
             {{
               item.pass === 1
-                ? "Análisis base sin filtros"
-                : "Análisis con filtros F1-F4"
+                ? "Pasadas base + con filtros (paralelas)"
+                : "Análisis con filtros activo"
             }}
           </div>
 
@@ -2130,6 +2237,22 @@ input[type="number"]:focus {
 .btn-cancel:hover {
   background: rgba(239, 68, 68, 0.1);
 }
+.filter-analysis-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  margin-left: auto;
+}
+.filter-analysis-toggle input {
+  accent-color: var(--accent);
+}
+.fa-warn {
+  color: #f59e0b;
+  font-size: 0.72rem;
+}
 
 .saved-ok-banner {
   background: rgba(34, 197, 94, 0.1);
@@ -3156,6 +3279,51 @@ input[type="number"]:focus {
 }
 
 /* Toggle de período */
+.mkt-label {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+.mkt-hint {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 0.4rem;
+}
+.mkt-filters {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+}
+.mkt-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--text);
+  cursor: pointer;
+}
+.mkt-fname {
+  font-weight: 600;
+  min-width: 130px;
+}
+.mkt-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  padding-left: 1.3rem;
+}
+.mkt-sub-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
 .period-toggle {
   display: flex;
   border: 1px solid var(--border);

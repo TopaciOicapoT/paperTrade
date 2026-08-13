@@ -64,15 +64,17 @@ _CURRENT_YEAR = 2026
 
 
 class SimulateRequest(BaseModel):
-    symbols:          list[str] = Field(min_length=1, max_length=16)
-    capital:          float     = Field(gt=0, le=1_000_000)
-    max_positions:    int       = Field(ge=1, le=10)
-    years:            int       = Field(ge=1, le=15, default=10)
-    leverage:         int       = Field(ge=1, le=10, default=3)
-    symbol_params:    dict[str, dict] | None = None
-    date_from:        str | None = None
-    date_to:          str | None = None
-    strategy_entries: list[dict] | None = None  # [{symbol, strategy, ...params}]
+    symbols:                list[str] = Field(min_length=1, max_length=16)
+    capital:                float     = Field(gt=0, le=1_000_000)
+    max_positions:          int       = Field(ge=1, le=10)
+    years:                  int       = Field(ge=1, le=15, default=10)
+    leverage:               int       = Field(ge=1, le=10, default=3)
+    symbol_params:          dict[str, dict] | None = None
+    date_from:              str | None = None
+    date_to:                str | None = None
+    strategy_entries:       list[dict] | None = None
+    levels_override:        dict | None = None
+    include_filter_analysis: bool = False  # True = pasada lenta de impacto de filtros
 
 
 @router.get("/symbols")
@@ -126,6 +128,8 @@ def start_simulation(body: SimulateRequest, request: Request):
         date_from=body.date_from,
         date_to=body.date_to,
         strategy_entries=body.strategy_entries,
+        levels_override=body.levels_override,
+        include_filter_analysis=body.include_filter_analysis,
     )
 
     return {

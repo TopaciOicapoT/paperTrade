@@ -10,10 +10,20 @@ const saveError = ref(null);
 // ── Estado editable ───────────────────────────────────────────────────────────
 const maxPositions = ref(3);
 const leverage = ref(3);
-const selectedEntries = ref([]); // [{ id, symbol, strategy, filters }]
+const selectedEntries = ref([]);
 let _nextId = 1;
 const dropdownSym = ref("");
 const dropdownStrat = ref("breakout");
+
+// Filtros globales de mercado
+const mktFilters = ref({
+  daily_vol_enabled: false,
+  daily_vol_ratio: 0.8,
+  crypto_trend: false,
+  crypto_slope_window: 7,
+  crypto_min_slope: 1.1,
+  crypto_min_absolute: 25.0,
+});
 
 const activeSymbols = computed(() => [
   ...new Set(selectedEntries.value.map((e) => e.symbol)),
@@ -110,6 +120,14 @@ async function load() {
   maxPositions.value = cfg.value.max_open_positions ?? 3;
   leverage.value = cfg.value.leverage ?? 3;
 
+  const lvl = cfg.value.levels ?? {};
+  mktFilters.value.daily_vol_enabled = (lvl.daily_vol_min_ratio ?? 0) > 0;
+  mktFilters.value.daily_vol_ratio = lvl.daily_vol_min_ratio ?? 0.8;
+  mktFilters.value.crypto_trend = lvl.crypto_trend_filter ?? false;
+  mktFilters.value.crypto_slope_window = lvl.crypto_trend_slope_window ?? 7;
+  mktFilters.value.crypto_min_slope = lvl.crypto_trend_min_slope ?? 1.1;
+  mktFilters.value.crypto_min_absolute = lvl.crypto_trend_min_absolute ?? 25.0;
+
   selectedEntries.value = [];
   const sp = cfg.value.symbol_params ?? {};
   for (const sym of cfg.value.symbols ?? []) {
@@ -165,6 +183,15 @@ async function save() {
         max_open_positions: maxPositions.value,
         leverage: leverage.value,
         symbol_params: buildSymbolParams(),
+        levels: {
+          daily_vol_min_ratio: mktFilters.value.daily_vol_enabled
+            ? mktFilters.value.daily_vol_ratio
+            : 0,
+          crypto_trend_filter: mktFilters.value.crypto_trend,
+          crypto_trend_slope_window: mktFilters.value.crypto_slope_window,
+          crypto_trend_min_slope: mktFilters.value.crypto_min_slope,
+          crypto_trend_min_absolute: mktFilters.value.crypto_min_absolute,
+        },
       }),
     });
     const data = await res.json();
@@ -222,6 +249,88 @@ async function save() {
                 : "Spot (sin apalancamiento)"
             }}</span>
           </div>
+        </div>
+      </div>
+
+      <!-- ── Condiciones de mercado ─────────────────────────────────────── -->
+      <div class="section">
+        <div class="section-title">Condiciones de mercado</div>
+        <p class="section-hint">
+          Filtros globales aplicados a Breakout y Retest. No aplican a Bounce.
+        </p>
+        <div
+          class="mkt-filters"
+          style="
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.6rem 0.9rem;
+          "
+        >
+          <label class="sfc-row">
+            <input type="checkbox" v-model="mktFilters.daily_vol_enabled" />
+            <span class="sfc-fname">Vol. diario mínimo</span>
+            <template v-if="mktFilters.daily_vol_enabled">
+              <input
+                class="sfc-num"
+                type="number"
+                step="0.05"
+                min="0"
+                max="1"
+                v-model.number="mktFilters.daily_vol_ratio"
+              />
+              <span class="sfc-unit">× media 20d</span>
+            </template>
+            <span v-else class="sfc-hint"
+              >descarta días con mercado dormido</span
+            >
+          </label>
+          <label class="sfc-row" style="margin-top: 0.25rem">
+            <input type="checkbox" v-model="mktFilters.crypto_trend" />
+            <span class="sfc-fname">Tendencia cripto</span>
+            <span class="sfc-hint"
+              >ADX subiendo o establecido (mejor que ADX estático para
+              crypto)</span
+            >
+          </label>
+          <template v-if="mktFilters.crypto_trend">
+            <div
+              class="mkt-sub"
+              style="
+                padding-left: 1.3rem;
+                display: flex;
+                align-items: center;
+                gap: 0.4rem;
+                font-size: 0.78rem;
+                color: var(--text-muted);
+                margin-top: 0.2rem;
+              "
+            >
+              <span>Ventana</span>
+              <input
+                class="sfc-num"
+                type="number"
+                min="3"
+                max="30"
+                v-model.number="mktFilters.crypto_slope_window"
+              />
+              <span class="sfc-unit">días</span>
+              <span style="margin-left: 0.5rem">Pendiente mín.</span>
+              <input
+                class="sfc-num"
+                type="number"
+                step="0.05"
+                v-model.number="mktFilters.crypto_min_slope"
+              />
+              <span class="sfc-unit">×</span>
+              <span style="margin-left: 0.5rem">ADX mín.</span>
+              <input
+                class="sfc-num"
+                type="number"
+                step="1"
+                v-model.number="mktFilters.crypto_min_absolute"
+              />
+            </div>
+          </template>
         </div>
       </div>
 

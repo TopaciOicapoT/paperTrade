@@ -547,13 +547,24 @@ def evaluar_estrategia(
             )
             return None
 
-    # 4. ADX — evitar mercados laterales (ADX < umbral)
+    # 4. ADX estándar — para otros mercados (acciones, forex). En crypto usar crypto_trend_filter.
     adx_min = levels_config.get("adx_min", 0)
     if adx_min > 0 and df_diario is not None and len(df_diario) >= 30:
         from indicators.technical import calcular_adx_series
         adx_val = float(calcular_adx_series(df_diario).iloc[-1])
         if adx_val < adx_min:
             logger.debug(f"{symbol} | ADX {adx_val:.1f} < {adx_min} — mercado lateral")
+            return None
+
+    # 4c. Filtro de tendencia cripto: ADX subiendo O ADX establecido
+    if levels_config.get("crypto_trend_filter", False) and df_diario is not None and len(df_diario) >= 35:
+        from indicators.technical import calcular_crypto_trend_series
+        sw  = levels_config.get("crypto_trend_slope_window", 7)
+        ms  = levels_config.get("crypto_trend_min_slope", 1.10)
+        ma  = levels_config.get("crypto_trend_min_absolute", 25.0)
+        ok_series = calcular_crypto_trend_series(df_diario, slope_window=sw, min_slope=ms, min_absolute=ma)
+        if not bool(ok_series.iloc[-1]):
+            logger.debug(f"{symbol} | CryptoTrend — ADX no sube ni está establecido")
             return None
 
     # 4b. Volumen diario — evitar días dormidos (vol < ratio × media 20d)
@@ -829,13 +840,23 @@ def evaluar_retest_signal(
     levels_cfg = config.get("levels", {})
     monthly_lookback = levels_cfg.get("monthly_lookback", 6)
 
-    # ADX y volumen diario aplican igual que en breakout: mercado lateral = retest no fiable
+    # ADX estándar (otros mercados) + filtro cripto de tendencia
     adx_min = levels_cfg.get("adx_min", 0)
     if adx_min > 0 and df_diario is not None and len(df_diario) >= 30:
         from indicators.technical import calcular_adx_series
         adx_val = float(calcular_adx_series(df_diario).iloc[-1])
         if adx_val < adx_min:
             logger.debug(f"{symbol} | [Retest] ADX {adx_val:.1f} < {adx_min} — mercado lateral")
+            return None
+
+    if levels_cfg.get("crypto_trend_filter", False) and df_diario is not None and len(df_diario) >= 35:
+        from indicators.technical import calcular_crypto_trend_series
+        sw = levels_cfg.get("crypto_trend_slope_window", 7)
+        ms = levels_cfg.get("crypto_trend_min_slope", 1.10)
+        ma = levels_cfg.get("crypto_trend_min_absolute", 25.0)
+        ok = calcular_crypto_trend_series(df_diario, slope_window=sw, min_slope=ms, min_absolute=ma)
+        if not bool(ok.iloc[-1]):
+            logger.debug(f"{symbol} | [Retest] CryptoTrend — ADX no sube ni establecido")
             return None
 
     daily_vol_min = levels_cfg.get("daily_vol_min_ratio", 0.0)

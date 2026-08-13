@@ -90,8 +90,11 @@ class PaperTrader:
         self._news_enabled       = news_cfg.get("enabled", False)
         self._news_pause_hours   = news_cfg.get("pause_hours", 4)
         self._news_check_interval = news_cfg.get("check_interval_minutes", 15) * 60
-        self._news_paused_until: float = 0.0   # timestamp UNIX
+        self._news_paused_until: float = 0.0
         self._news_last_check: float = 0.0
+
+        # Cooldown post-SL: (symbol, direction, level_rounded) → timestamp_unix_expiry
+        self._loss_cooldown: dict[tuple, float] = {}
 
         self._cargar_estado()
 
@@ -294,6 +297,18 @@ class PaperTrader:
 
             del self.open_orders[symbol]
             self.risk_manager.registrar_cierre(symbol)
+
+            # Registrar cooldown si fue un SL: no re-entrar en el mismo nivel por N horas
+            if exit_type == "SL":
+                cooldown_bars = self.config.get("levels", {}).get("breakout_loss_cooldown_bars", 0)
+                if cooldown_bars > 0:
+                    # En el live bot el TF de entrada es 1m; cooldown_bars está en 5m → ×5
+                    cooldown_secs = cooldown_bars * 5 * 60
+                    level_rounded = round(order.get("monthly_level", exit_price), 4)
+                    key = (symbol, order["direction"], level_rounded)
+                    self._loss_cooldown[key] = time.time() + cooldown_secs
+                    logger.debug(f"[Cooldown] {symbol} {order['direction']} nivel {level_rounded} — bloqueado {cooldown_bars*5/60:.0f}h")
+
             self._guardar_estado()
 
     def _log_event(
@@ -378,6 +393,20 @@ class PaperTrader:
                 level_name=getattr(signal, "level_name", None),
                 volume_ratio=signal.volume_ratio,
             )
+
+            # Cooldown post-SL: bloquear re-entrada en el mismo nivel
+            if self._loss_cooldown:
+                level_rounded = round(signal.monthly_level, 4)
+                cd_key = (symbol, signal.direction, level_rounded)
+                if cd_key in self._loss_cooldown:
+                    if time.time() < self._loss_cooldown[cd_key]:
+                        self._log_event(
+                            **_log_base, event_type="REJECTED_RISK",
+                            rejection_reason="Cooldown post-SL activo para este nivel",
+                        )
+                        return
+                    else:
+                        del self._loss_cooldown[cd_key]
 
             # ── Comprobaciones post-señal con logging ─────────────────────────
 

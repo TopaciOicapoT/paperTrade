@@ -41,6 +41,32 @@ def calcular_adx_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=period).adx()
 
 
+def calcular_crypto_trend_series(
+    df: pd.DataFrame,
+    slope_window: int = 7,
+    min_slope: float = 1.10,
+    min_absolute: float = 25.0,
+    period: int = 14,
+) -> pd.Series:
+    """
+    Filtro de tendencia para mercados cripto.
+
+    Pasa (True) si se cumple al menos una condición:
+      A) ADX está subiendo: ADX[hoy] >= ADX[hace N días] × min_slope  (tendencia construyéndose)
+      B) ADX ya establecido:  ADX[hoy] >= min_absolute                 (tendencia consolidada)
+
+    Ventaja vs ADX estándar: captura el arranque del bull run cuando el ADX
+    aún es bajo pero ya está acelerando hacia arriba.
+    """
+    adx = calcular_adx_series(df, period=period)
+    adx_past = adx.shift(slope_window)
+
+    building    = (adx_past > 0) & ((adx / adx_past.clip(lower=0.001)) >= min_slope)
+    established = adx >= min_absolute
+
+    return (building | established).fillna(False)
+
+
 def calcular_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula todas las features técnicas sobre un DataFrame OHLCV.

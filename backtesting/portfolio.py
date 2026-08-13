@@ -38,6 +38,18 @@ def run_simulation(
     monthly_lookback = config["levels"]["monthly_lookback"]
     extra_days = monthly_lookback * 30 + 30
 
+    # Parámetros de filtros globales (ADX estándar, crypto trend, vol diario)
+    lvl = config.get("levels", {})
+    _crypto_kw = dict(
+        _adx_min=lvl.get("adx_min", 0) if apply_filters else 0,
+        _daily_vol_min=lvl.get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
+        _crypto_trend=lvl.get("crypto_trend_filter", False) if apply_filters else False,
+        _crypto_slope_window=lvl.get("crypto_trend_slope_window", 7),
+        _crypto_min_slope=lvl.get("crypto_trend_min_slope", 1.10),
+        _crypto_min_absolute=lvl.get("crypto_trend_min_absolute", 25.0),
+        _breakout_cooldown=lvl.get("breakout_loss_cooldown_bars", 0) if apply_filters else 0,
+    )
+
     # Modo strategy_entries: agrupa por símbolo para descargar datos una sola vez
     sym_to_entries: dict[str, list[dict]] = {}
     if strategy_entries is not None:
@@ -54,20 +66,34 @@ def run_simulation(
     all_trades: list[dict] = []
     actual_days = days
 
+    # Pre-calcular fetch_days (igual para todos los símbolos)
+    if date_from:
+        from datetime import date as _date
+        fetch_days = (_date.today() - _date.fromisoformat(date_from)).days + extra_days + 60
+    else:
+        fetch_days = days + extra_days + 60
+
+    # Descargar datos de todos los símbolos en paralelo (I/O bound)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def _fetch_sym(sym):
+        return sym, (
+            fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange),
+            fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange),
+            fetch_ohlcv(sym, "1w", limit=220, exchange=exchange),
+        )
+
+    sym_data: dict = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as pool:
+        futures = {pool.submit(_fetch_sym, s): s for s in symbols}
+        for fut in as_completed(futures):
+            s, dfs = fut.result()
+            sym_data[s] = dfs
+
     for idx, sym in enumerate(symbols, 1):
         if progress_cb:
             progress_cb(f"SYM:{idx}:{len(symbols)}:{sym}")
 
-        # Con rango de fechas hay que descargar desde date_from hasta hoy, no solo el span del rango
-        if date_from:
-            from datetime import date as _date
-            days_back = (_date.today() - _date.fromisoformat(date_from)).days
-            fetch_days = days_back + extra_days + 60
-        else:
-            fetch_days = days + extra_days + 60
-        df_5m = fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange)
-        df_1d = fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange)
-        df_1w = fetch_ohlcv(sym, "1w", limit=220, exchange=exchange)
+        df_5m, df_1d, df_1w = sym_data[sym]
 
         if date_from or date_to:
             if date_from:
@@ -107,8 +133,7 @@ def run_simulation(
                         failed_retest_filter=bp.get("failed_retest_filter", True) if apply_filters else False,
                         symbol_params={sym: bp} if bp else None,
                         rsi_overbought_block=bp.get("rsi_overbought_block") if apply_filters else None,
-                        _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
-                        _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
+                        **_crypto_kw,
                         **_common_kw,
                     )
                     entry_trades.extend(res.trades)
@@ -119,8 +144,7 @@ def run_simulation(
                         df_entry=df_5m,
                         sl_behind_pct=0.5,
                         symbol_params={sym: ep},
-                        _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
-                        _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
+                        **_crypto_kw,
                         **_common_kw,
                     )
                     entry_trades.extend(res_rt.trades)
@@ -177,8 +201,7 @@ def run_simulation(
                 failed_retest_filter=apply_filters,
                 symbol_params=sym_params,
                 rsi_overbought_block=rsi_block,
-                _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
-                _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
+                **_crypto_kw,
             )
             sym_trades_all.extend(res.trades)
 
@@ -196,8 +219,7 @@ def run_simulation(
                 leverage=leverage,
                 initial_capital=capital,
                 symbol_params=sym_params,
-                _adx_min=config["levels"].get("adx_min", 0) if apply_filters else 0,
-                _daily_vol_min=config["levels"].get("daily_vol_min_ratio", 0.0) if apply_filters else 0.0,
+                **_crypto_kw,
             )
             sym_trades_all.extend(res_rt.trades)
 
@@ -433,8 +455,33 @@ def run_filter_analysis(
             for e in breakout_entries
         }
 
-    # _data_cache evita descargar el mismo símbolo dos veces si hay varios entries
+    # Pre-calcular fetch_days y descargar todos los símbolos en paralelo
+    if date_from:
+        from datetime import date as _date
+        fetch_days = (_date.today() - _date.fromisoformat(date_from)).days + extra_days + 60
+    else:
+        fetch_days = days + extra_days + 60
+
+    def _fetch_sym_fa(sym):
+        df_5m = fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange)
+        df_1d = fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange)
+        df_1w = fetch_ohlcv(sym, "1w", limit=220, exchange=exchange)
+        if date_from or date_to:
+            if date_from:
+                ts_from = pd.Timestamp(date_from, tz="UTC")
+                df_5m = df_5m[df_5m.index >= ts_from]
+            if date_to:
+                ts_to = pd.Timestamp(date_to, tz="UTC") + pd.Timedelta(days=1)
+                df_5m = df_5m[df_5m.index < ts_to]
+        return sym, (df_5m, df_1d, df_1w)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     _data_cache: dict = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as pool:
+        futures = {pool.submit(_fetch_sym_fa, s): s for s in symbols}
+        for fut in as_completed(futures):
+            s, dfs = fut.result()
+            _data_cache[s] = dfs
 
     for sym in symbols:
         ek = f"{sym} · breakout" if strategy_entries is not None else sym
@@ -443,24 +490,6 @@ def run_filter_analysis(
         if progress_cb:
             progress_cb(f"FILTERANAL:{ek}")
 
-        if sym not in _data_cache:
-            if date_from:
-                from datetime import date as _date
-                days_back = (_date.today() - _date.fromisoformat(date_from)).days
-                fetch_days = days_back + extra_days + 60
-            else:
-                fetch_days = days + extra_days + 60
-            df_5m = fetch_ohlcv(sym, "5m", limit=fetch_days * 24 * 12, exchange=exchange)
-            df_1d = fetch_ohlcv(sym, "1d", limit=fetch_days + extra_days, exchange=exchange)
-            df_1w = fetch_ohlcv(sym, "1w", limit=220, exchange=exchange)
-            if date_from or date_to:
-                if date_from:
-                    ts_from = pd.Timestamp(date_from, tz="UTC")
-                    df_5m = df_5m[df_5m.index >= ts_from]
-                if date_to:
-                    ts_to = pd.Timestamp(date_to, tz="UTC") + pd.Timedelta(days=1)
-                    df_5m = df_5m[df_5m.index < ts_to]
-            _data_cache[sym] = (df_5m, df_1d, df_1w)
         df_5m, df_1d, df_1w = _data_cache[sym]
 
         common = dict(

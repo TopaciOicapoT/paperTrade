@@ -63,6 +63,50 @@ def get_data_exchange() -> ccxt.binance:
     return exchange
 
 
+def _download_since(
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    exchange: ccxt.binance,
+    max_candles: int | None = None,
+) -> list:
+    """Descarga todas las velas disponibles desde since_ms hasta ahora."""
+    tf_secs = _TF_SECONDS.get(timeframe, 60)
+    all_raw: list = []
+    cursor_ms = since_ms
+    while True:
+        batch_limit = min(_BINANCE_MAX_CANDLES, max_candles - len(all_raw)) if max_candles else _BINANCE_MAX_CANDLES
+        if batch_limit <= 0:
+            break
+        for attempt, wait in enumerate([0] + _RETRY_BACKOFF, start=1):
+            try:
+                if wait:
+                    time.sleep(wait)
+                batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor_ms, limit=batch_limit)
+                break
+            except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
+                if attempt > _MAX_RETRIES:
+                    raise
+                logger.warning(f"Reintento {attempt} para {symbol} {timeframe}: {e}")
+        if not batch:
+            break
+        all_raw.extend(batch)
+        cursor_ms = batch[-1][0] + 1
+        if len(batch) < _BINANCE_MAX_CANDLES:
+            break  # no hay más datos
+    return all_raw
+
+
+def _raw_to_df(raw: list) -> pd.DataFrame:
+    """Convierte lista de candles raw a DataFrame con índice temporal."""
+    if not raw:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    return df.astype(float)
+
+
 def fetch_ohlcv(
     symbol: str,
     timeframe: str,
@@ -71,72 +115,70 @@ def fetch_ohlcv(
     use_cache: bool = True,
 ) -> pd.DataFrame:
     """
-    Descarga velas OHLCV para un símbolo y marco temporal.
+    Descarga velas OHLCV con caché incremental persistente.
 
-    Args:
-        symbol:    Par de trading, ej. "BTC/USDT"
-        timeframe: Marco temporal, ej. "1m", "5m", "1d", "1w"
-        limit:     Número de velas a descargar
-        exchange:  Instancia de ccxt (se crea si no se pasa)
-        use_cache: Si True, usa caché local para datos históricos
-
-    Returns:
-        DataFrame con columnas: timestamp, open, high, low, close, volume
+    El archivo de caché almacena TODO el histórico disponible para el símbolo
+    y timeframe. En llamadas posteriores solo se descargan las velas nuevas,
+    haciendo la segunda simulación casi instantánea.
     """
-    cache_file = CACHE_DIR / f"{symbol.replace('/', '_')}_{timeframe}_{limit}.pkl"
-
-    if use_cache and cache_file.exists():
-        age_minutes = (time.time() - cache_file.stat().st_mtime) / 60
-        # Refrescar caché si tiene más de 5 minutos (para timeframes cortos)
-        max_age = 5 if timeframe in ("1m", "5m") else 60
-        if age_minutes < max_age:
-            logger.debug(f"Cargando desde caché: {cache_file.name}")
-            return pd.read_pickle(cache_file)
+    # Caché persistente sin el limit en el nombre — se extiende automáticamente
+    cache_file = CACHE_DIR / f"{symbol.replace('/', '_')}_{timeframe}.pkl"
+    tf_secs = _TF_SECONDS.get(timeframe, 60)
 
     if exchange is None:
-        exchange = get_exchange(testnet=True)
+        exchange = get_data_exchange()
 
-    logger.info(f"Descargando {limit} velas {timeframe} de {symbol}...")
+    now_ms = int(time.time() * 1000)
+    need_since_ms = int((time.time() - tf_secs * (limit + 100)) * 1000)
 
-    tf_secs = _TF_SECONDS.get(timeframe, 60)
-    since_ms = int((time.time() - tf_secs * limit) * 1000)
+    cached_df: pd.DataFrame | None = None
+    if use_cache and cache_file.exists():
+        try:
+            cached_df = pd.read_pickle(cache_file)
+            if len(cached_df) == 0:
+                cached_df = None
+        except Exception:
+            cached_df = None
 
-    all_raw: list = []
-    while len(all_raw) < limit:
-        batch_limit = min(_BINANCE_MAX_CANDLES, limit - len(all_raw))
+    if cached_df is not None:
+        cache_start_ms = int(cached_df.index[0].timestamp() * 1000)
+        cache_end_ms   = int(cached_df.index[-1].timestamp() * 1000)
 
-        for attempt, wait in enumerate([0] + _RETRY_BACKOFF, start=1):
-            try:
-                if wait:
-                    logger.warning(f"Reintento {attempt}/{_MAX_RETRIES} para {symbol} {timeframe} en {wait}s...")
-                    time.sleep(wait)
-                batch = exchange.fetch_ohlcv(
-                    symbol, timeframe=timeframe, since=since_ms, limit=batch_limit
-                )
-                break
-            except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
-                if attempt > _MAX_RETRIES:
-                    raise
-                logger.warning(f"Error de red ({e}), reintentando...")
+        # ¿Necesitamos datos más antiguos que los que tenemos en caché?
+        if cache_start_ms > need_since_ms + tf_secs * 1000 * 10:
+            logger.info(f"[Cache] {symbol} {timeframe} — extendiendo hacia atrás hasta {pd.Timestamp(need_since_ms, unit='ms', tz='UTC').date()}")
+            older_raw = _download_since(symbol, timeframe, need_since_ms, exchange,
+                                        max_candles=(cache_start_ms - need_since_ms) // (tf_secs * 1000) + 200)
+            if older_raw:
+                older_df = _raw_to_df([r for r in older_raw if r[0] < cache_start_ms])
+                if len(older_df):
+                    cached_df = pd.concat([older_df, cached_df])
+                    cached_df = cached_df[~cached_df.index.duplicated(keep="last")].sort_index()
 
-        if not batch:
-            break
-        all_raw.extend(batch)
-        since_ms = batch[-1][0] + 1  # siguiente vela tras la última recibida
-        if len(batch) < batch_limit:
-            break  # no hay más datos disponibles
+        # Descargar candles nuevas desde el final del caché
+        stale_secs = (now_ms - cache_end_ms) / 1000
+        if stale_secs > tf_secs * 2:
+            logger.info(f"[Cache] {symbol} {timeframe} — actualizando {stale_secs/3600:.1f}h de datos nuevos")
+            new_raw = _download_since(symbol, timeframe, cache_end_ms + 1, exchange)
+            if new_raw:
+                new_df = _raw_to_df(new_raw)
+                cached_df = pd.concat([cached_df, new_df])
+                cached_df = cached_df[~cached_df.index.duplicated(keep="last")].sort_index()
+        else:
+            logger.debug(f"[Cache] {symbol} {timeframe} — datos al día ({stale_secs/60:.0f} min de retraso)")
 
-    raw = all_raw[-limit:]  # tomar solo las últimas `limit` velas
+        if use_cache:
+            cached_df.to_pickle(cache_file)
 
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df.set_index("timestamp", inplace=True)
-    df = df.astype(float)
+        return cached_df.tail(limit)
 
-    if use_cache:
+    # Sin caché — descarga completa desde need_since_ms
+    logger.info(f"Descargando historial completo {symbol} {timeframe} (primera vez)…")
+    raw = _download_since(symbol, timeframe, need_since_ms, exchange)
+    df = _raw_to_df(raw)
+    if use_cache and len(df):
         df.to_pickle(cache_file)
-
-    return df
+    return df.tail(limit)
 
 
 def fetch_multi_timeframe(

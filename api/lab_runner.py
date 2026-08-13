@@ -83,10 +83,13 @@ def start_simulation(
     date_from: str | None = None,
     date_to: str | None = None,
     strategy_entries: list[dict] | None = None,
+    levels_override: dict | None = None,
+    include_filter_analysis: bool = False,
 ):
-    # strategy_entries tiene prioridad; si no se provee, aplicar symbol_params legacy
     if strategy_entries is None and symbol_params_override is not None:
         config = {**config, "symbol_params": symbol_params_override}
+    if levels_override:
+        config = {**config, "levels": {**config.get("levels", {}), **levels_override}}
 
     with _lock:
         _jobs[job_id]["status"] = "running"
@@ -101,45 +104,63 @@ def start_simulation(
     def _run():
         try:
             from backtesting.portfolio import run_simulation
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
             sym_list = ', '.join(symbols)
             yrs = round(days / 365, 1)
             period_label = f"{date_from} → {date_to}" if date_from else f"{yrs} años"
             _progress(f"Iniciando análisis: {sym_list} · {period_label} · capital ${capital}")
 
+            # ── Pass 1 y Pass 2 en paralelo ──────────────────────────────────
+            # Las dos pasadas son completamente independientes; ThreadPoolExecutor
+            # permite solaparlas y aprovechar que pandas/numpy liberan el GIL.
             _progress("PASS:1")
-            _progress("Análisis BASE (sin filtros F1-F4) — viendo el rendimiento bruto de la estrategia")
-            sin = run_simulation(
+            _progress("PASS:2")
+            _progress("Analizando base (sin filtros) y con filtros en paralelo…")
+
+            common = dict(
                 symbols=symbols, capital=capital, max_positions=max_positions,
-                days=days, leverage=leverage, config=config, apply_filters=False,
-                progress_cb=_progress, date_from=date_from, date_to=date_to,
-                strategy_entries=strategy_entries,
+                days=days, leverage=leverage, config=config,
+                date_from=date_from, date_to=date_to, strategy_entries=strategy_entries,
             )
 
-            _progress("PASS:2")
-            _progress("Análisis CON FILTROS (F1-F4 activos) — viendo el efecto de los filtros optimizados")
-            con = run_simulation(
-                symbols=symbols, capital=capital, max_positions=max_positions,
-                days=days, leverage=leverage, config=config, apply_filters=True,
-                progress_cb=_progress, date_from=date_from, date_to=date_to,
-                strategy_entries=strategy_entries,
-            )
+            def _sym_progress(msg):
+                if cancel_event.is_set():
+                    raise InterruptedError("Cancelado")
+                _set_progress(job_id, msg)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_sin = pool.submit(run_simulation, **common, apply_filters=False, progress_cb=_sym_progress)
+                f_con = pool.submit(run_simulation, **common, apply_filters=True,  progress_cb=None)
+                sin = f_sin.result()
+                con = f_con.result()
 
             _progress("DONE")
 
-            _progress("FILTERPASS")
-            _progress("Analizando el impacto individual de cada filtro por criptomoneda…")
-            from backtesting.portfolio import run_filter_analysis
-            # Derivar la lista de símbolos únicos para el análisis legacy
-            filter_syms = list(dict.fromkeys(e["symbol"] for e in strategy_entries)) if strategy_entries else symbols
-            filter_analysis = run_filter_analysis(
-                symbols=filter_syms, days=days, leverage=leverage,
-                config=config, progress_cb=_progress,
-                date_from=date_from, date_to=date_to,
-                strategy_entries=strategy_entries,
-            )
+            # ── Análisis de filtros (opcional) ────────────────────────────────
+            filter_analysis: dict = {}
+            if include_filter_analysis:
+                _progress("FILTERPASS")
+                _progress("Analizando el impacto individual de cada filtro por criptomoneda…")
+                from backtesting.portfolio import run_filter_analysis
 
-            # Derivare result_syms dalle chiavi reali: prima con, poi sin, poi fallback
+                filter_syms = list(dict.fromkeys(e["symbol"] for e in strategy_entries)) if strategy_entries else symbols
+
+                # Ejecutar análisis de filtros por símbolo en paralelo
+                def _fa_one(sym):
+                    _set_progress(job_id, f"FILTERANAL:{sym}")
+                    from backtesting.portfolio import run_filter_analysis as _rfa
+                    return _rfa(
+                        symbols=[sym], days=days, leverage=leverage, config=config,
+                        date_from=date_from, date_to=date_to,
+                        strategy_entries=[e for e in (strategy_entries or []) if e["symbol"] == sym] or None,
+                    )
+
+                with ThreadPoolExecutor(max_workers=min(len(filter_syms), 4)) as pool:
+                    futures = {pool.submit(_fa_one, s): s for s in filter_syms}
+                    for fut in as_completed(futures):
+                        filter_analysis.update(fut.result())
+
             _por_con = con.get("por_simbolo") or []
             _por_sin = sin.get("por_simbolo") or []
             _por_any = _por_con if _por_con else _por_sin

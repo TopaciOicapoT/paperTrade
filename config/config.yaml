@@ -9,12 +9,17 @@ guardrails:
   max_daily_loss_pct: 3.0
   max_drawdown_pct: 15.0
 levels:
-  adx_min: 20
-  daily_vol_min_ratio: 0.8
+  adx_min: 0
   approach_pct: 0.3
   bounce_min_range_pct: 2.0
   bounce_wick_min_pct: 0.1
+  breakout_loss_cooldown_bars: 576  # cooldown 48h post-SL (576 × 5m = 48h en backtest; ajustar en live bot)
+  crypto_trend_filter: true
+  crypto_trend_min_absolute: 25
+  crypto_trend_min_slope: 1.1
+  crypto_trend_slope_window: 7
   daily_lookback: 20
+  daily_vol_min_ratio: 0.8
   failed_retest_auto_lookback: 2500
   failed_retest_filter: auto
   failed_retest_lookback: 300

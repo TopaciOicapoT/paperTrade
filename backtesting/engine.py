@@ -80,8 +80,13 @@ def simular_trades(
     symbol_params: dict | None = None,
     rsi_overbought_block: float | None = None,
     trend_filter: bool = False,
-    _adx_min: float = 0,               # umbral ADX; 0 = desactivado
-    _daily_vol_min: float = 0.0,       # ratio vol diario mínimo; 0 = desactivado
+    _adx_min: float = 0,
+    _daily_vol_min: float = 0.0,
+    _crypto_trend: bool = False,
+    _crypto_slope_window: int = 7,
+    _crypto_min_slope: float = 1.10,
+    _crypto_min_absolute: float = 25.0,
+    _breakout_cooldown: int = 0,    # cooldown en barras post-SL (0 = desactivado)
 ) -> BacktestResult:
     """
     Simula la estrategia de breakout mensual sobre datos históricos.
@@ -173,15 +178,24 @@ def simular_trades(
             f"({n_bull/len(trend_series)*100:.0f}% alcista)"
         )
 
-    # ── Pre-calcular ADX diario y ratio de volumen diario ──
+    # ── Pre-calcular ADX estándar, filtro crypto y ratio de volumen diario ──
     adx_min       = sym_ov.get("adx_min", _adx_min)
     daily_vol_min = sym_ov.get("daily_vol_min_ratio", _daily_vol_min)
     adx_series_daily: pd.Series | None = None
     daily_vol_ratio: pd.Series | None = None
+    crypto_trend_ok: pd.Series | None = None
     if adx_min > 0 and df_daily is not None and len(df_daily) >= 30:
         from indicators.technical import calcular_adx_series
         adx_series_daily = calcular_adx_series(df_daily)
-        logger.info(f"[ADX] Pre-calculado | umbral mínimo: {adx_min}")
+    if _crypto_trend and df_daily is not None and len(df_daily) >= 35:
+        from indicators.technical import calcular_crypto_trend_series
+        crypto_trend_ok = calcular_crypto_trend_series(
+            df_daily,
+            slope_window=_crypto_slope_window,
+            min_slope=_crypto_min_slope,
+            min_absolute=_crypto_min_absolute,
+        )
+        logger.info(f"[CryptoTrend] Pre-calculado | slope_w={_crypto_slope_window} min_slope={_crypto_min_slope} min_abs={_crypto_min_absolute}")
     if daily_vol_min > 0 and df_daily is not None and len(df_daily) >= 21:
         daily_vol_ratio = df_daily["volume"] / df_daily["volume"].rolling(20).mean().shift(1)
 
@@ -203,7 +217,12 @@ def simular_trades(
         )
 
     # ── Bucle principal por vela de entrada ──
-    auto_regime_cache: dict = {}   # (level, direction, date) → (use_fr, fr_pct)
+    auto_regime_cache: dict = {}
+    # Cooldown por nivel: evita re-entrar en el mismo nivel tras un SL
+    # Clave: f"{direction}_{level_rounded}" → índice de la última pérdida
+    _loss_cooldown_bars = sym_ov.get("breakout_loss_cooldown_bars", _breakout_cooldown)
+    _level_loss_bar: dict[str, int] = {}
+
     for i in range(50, len(df_entry) - 1):
         window_entry = df_entry.iloc[max(0, i - 200): i + 1]
         current = df_entry.iloc[i]
@@ -230,17 +249,20 @@ def simular_trades(
                 pnl = (open_trade.exit_price - open_trade.entry_price) / open_trade.entry_price
                 if open_trade.direction == "short":
                     pnl = -pnl
-                # Aplicar apalancamiento antes de descontar fees
                 pnl *= leverage
-                # Descontar comisión de apertura + cierre (ambos lados)
                 pnl -= (fee_pct / 100) * 2
                 open_trade.pnl_pct = round(pnl * 100, 4)
                 open_trade.bars_to_exit = i - open_trade.entry_index
 
+                # Registrar cooldown si fue un SL
+                if open_trade.result == "loss" and _loss_cooldown_bars > 0:
+                    _loss_key = f"{open_trade.direction}_{round(open_trade.stop_loss, 4)}"
+                    _level_loss_bar[_loss_key] = i
+
                 result.trades.append(open_trade)
                 equity_curve.append(equity_curve[-1] * (1 + pnl))
                 open_trade = None
-                trade_just_closed = True  # no re-entrar en la misma vela
+                trade_just_closed = True
 
         if open_trade is not None or trade_just_closed:
             continue
@@ -276,10 +298,20 @@ def simular_trades(
 
         monthly_level = monthly.resistance if direction == "long" else monthly.support
 
-        # ── Filtro ADX — mercado lateral (ADX < umbral) ──────────────────────
+        # ── Cooldown post-SL: no re-entrar en el mismo nivel tras una pérdida ──
+        if _loss_cooldown_bars > 0:
+            _loss_key = f"{direction}_{round(monthly_level, 4)}"
+            if i - _level_loss_bar.get(_loss_key, 0) < _loss_cooldown_bars:
+                continue
         if adx_series_daily is not None and adx_min > 0:
             adx_val = adx_series_daily.asof(df_entry.index[i])
             if pd.isna(adx_val) or float(adx_val) < adx_min:
+                continue
+
+        # ── Filtro de tendencia cripto ────────────────────────────────────
+        if crypto_trend_ok is not None:
+            trend_val = crypto_trend_ok.asof(df_entry.index[i])
+            if not bool(trend_val):
                 continue
 
         # ── Filtro volumen diario — mercado dormido ───────────────────────────
@@ -821,6 +853,10 @@ def simular_trades_retest(
     symbol_params: dict | None = None,
     _adx_min: float = 0,
     _daily_vol_min: float = 0.0,
+    _crypto_trend: bool = False,
+    _crypto_slope_window: int = 7,
+    _crypto_min_slope: float = 1.10,
+    _crypto_min_absolute: float = 25.0,
 ) -> "BacktestResult":
     """Entrada en pullback/retest post-breakout. Parámetros sobreescribibles por símbolo."""
     sp = (symbol_params or {}).get(symbol, {})
@@ -853,12 +889,19 @@ def simular_trades_retest(
     logger.enable("indicators.levels")
     logger.info(f"[Retest] Niveles pre-calculados para {len(daily_levels_cache)} días")
 
-    # ── Pre-calcular ADX y volumen diario (mismo criterio que breakout) ──
+    # ── Pre-calcular ADX, filtro crypto y volumen diario ──
     adx_series_rt: pd.Series | None = None
     daily_vol_rt: pd.Series | None = None
+    crypto_trend_rt: pd.Series | None = None
     if adx_min > 0 and len(df_daily) >= 30:
         from indicators.technical import calcular_adx_series
         adx_series_rt = calcular_adx_series(df_daily)
+    if _crypto_trend and len(df_daily) >= 35:
+        from indicators.technical import calcular_crypto_trend_series
+        crypto_trend_rt = calcular_crypto_trend_series(
+            df_daily, slope_window=_crypto_slope_window,
+            min_slope=_crypto_min_slope, min_absolute=_crypto_min_absolute,
+        )
     if daily_vol_min > 0 and len(df_daily) >= 21:
         daily_vol_rt = df_daily["volume"] / df_daily["volume"].rolling(20).mean().shift(1)
 
@@ -905,10 +948,13 @@ def simular_trades_retest(
         if monthly is None:
             continue
 
-        # ADX y volumen diario (misma lógica que breakout — mercado lateral = retest no fiable)
+        # ADX estándar, filtro cripto y volumen diario
         if adx_series_rt is not None and adx_min > 0:
             adx_v = adx_series_rt.asof(df_entry.index[i])
             if pd.isna(adx_v) or float(adx_v) < adx_min:
+                continue
+        if crypto_trend_rt is not None:
+            if not bool(crypto_trend_rt.asof(df_entry.index[i])):
                 continue
         if daily_vol_rt is not None and daily_vol_min > 0:
             dvr = daily_vol_rt.asof(df_entry.index[i])
