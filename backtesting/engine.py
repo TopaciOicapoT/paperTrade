@@ -33,11 +33,12 @@ class Trade:
     entry_index: int
     exit_index: int = -1
     exit_price: float = 0.0
-    result: str = "open"        # "win", "loss", "open"
+    result: str = "open"
     pnl_pct: float = 0.0
     level_name: str = ""
+    monthly_level: float = 0.0        # precio del nivel mensual que provocó la señal
     # ── Metadatos para análisis de fallos ──
-    volume_ratio: float = 0.0         # Spike de volumen en el momento de entrada
+    volume_ratio: float = 0.0
     level_distance_pct: float = 0.0   # Distancia entry → nivel mensual (%)
     bars_to_exit: int = 0             # Velas hasta resolver el trade
 
@@ -256,7 +257,7 @@ def simular_trades(
 
                 # Registrar cooldown si fue un SL
                 if open_trade.result == "loss" and _loss_cooldown_bars > 0:
-                    _loss_key = f"{open_trade.direction}_{round(open_trade.stop_loss, 4)}"
+                    _loss_key = f"{open_trade.direction}_{open_trade.monthly_level}"
                     _level_loss_bar[_loss_key] = i
 
                 result.trades.append(open_trade)
@@ -298,7 +299,6 @@ def simular_trades(
 
         monthly_level = monthly.resistance if direction == "long" else monthly.support
 
-        # ── Cooldown post-SL: no re-entrar en el mismo nivel tras una pérdida ──
         if _loss_cooldown_bars > 0:
             _loss_key = f"{direction}_{round(monthly_level, 4)}"
             if i - _level_loss_bar.get(_loss_key, 0) < _loss_cooldown_bars:
@@ -426,6 +426,7 @@ def simular_trades(
             take_profit=tp,
             entry_index=i,
             level_name=f"monthly_{'resistance' if direction == 'long' else 'support'}",
+            monthly_level=round(monthly_level, 4),
             volume_ratio=round(volume_ratio, 2),
             level_distance_pct=round(
                 abs(entry_price - monthly_level) / monthly_level * 100, 3
