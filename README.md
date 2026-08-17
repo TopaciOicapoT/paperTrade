@@ -235,6 +235,57 @@ docker compose up --build -d
 
 El Dockerfile hace el build de Vue y FastAPI sirve el `frontend/dist/` en `/`. Solo se expone el puerto 8000.
 
+### Deploy económico con CI/CD
+
+El archivo `docker-compose.prod.yml` está preparado para producción: PostgreSQL no se publica en Internet, los datos viven en volúmenes persistentes y la API se actualiza mediante una imagen Docker publicada en GHCR.
+
+**Opciones de servidor:**
+
+- **Google Cloud Always Free**: VM `e2-micro` en una región elegible. Requiere tarjeta para verificación y cuota disponible; es la opción gratuita más cercana a un VPS 24/7.
+- **AWS Free Tier**: una instancia pequeña durante los primeros 12 meses, según la cuenta y región.
+- **Hetzner**: no es gratuito, pero suele ser la opción económica más predecible para un bot 24/7.
+
+Render/Koyeb gratuitos no son recomendables para este proyecto porque pueden suspender el servicio y no ofrecen persistencia PostgreSQL suficiente para el bot.
+
+**Preparación inicial del servidor Ubuntu:**
+
+```bash
+sudo apt update
+sudo apt install -y docker.io docker-compose-plugin
+sudo usermod -aG docker $USER
+mkdir -p /opt/papertrade/config
+```
+
+Cierra y vuelve a abrir la sesión SSH después de añadir el usuario al grupo Docker. Crea `/opt/papertrade/.env` en el servidor y nunca lo subas al repositorio:
+
+```dotenv
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+POSTGRES_PASSWORD=una_contrasena_larga_y_unica
+```
+
+En GitHub, añade estos **Actions secrets** en `Settings → Secrets and variables → Actions`:
+
+| Secret | Contenido |
+|--------|-----------|
+| `SERVER_HOST` | IP o dominio del servidor |
+| `SERVER_USER` | Usuario SSH, por ejemplo `ubuntu` |
+| `SERVER_SSH_KEY` | Clave privada SSH de despliegue |
+| `SERVER_PORT` | Puerto SSH, opcional; por defecto `22` |
+
+Haz público el paquete `ghcr.io/topacioicapot/papertrade` o configura autenticación GHCR en el servidor. El workflow `.github/workflows/deploy.yml` se ejecuta con cada push a `main`: construye Vue + Python, publica `latest`, copia Compose/config y ejecuta `docker compose pull` + `up -d` por SSH. Los secretos de Binance y PostgreSQL permanecen únicamente en el servidor.
+
+Para el primer arranque:
+
+```bash
+cd /opt/papertrade
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs -f api
+```
+
+El volumen `postgres_data` conserva la base de datos entre actualizaciones. Los volúmenes `bot_logs` y `bot_models` conservan estado, logs y modelo; `config/` se actualiza automáticamente desde el commit desplegado.
+
 **Endpoints de la API REST:**
 
 | Método | Ruta | Descripción |
