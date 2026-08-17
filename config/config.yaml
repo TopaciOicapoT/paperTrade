@@ -13,7 +13,7 @@ levels:
   approach_pct: 0.3
   bounce_min_range_pct: 2.0
   bounce_wick_min_pct: 0.1
-  breakout_loss_cooldown_bars: 144  # cooldown 48h post-SL (576 × 5m = 48h en backtest; ajustar en live bot)
+  breakout_loss_cooldown_bars: 0  # cooldown 48h post-SL (576 × 5m = 48h en backtest; ajustar en live bot)
 #   576 (48h) — actual: para demasiadas entradas buenas
 # 288 (24h) — intermedio: testear
 # 144 (12h) — mínimo para parar la cascada de AXS
