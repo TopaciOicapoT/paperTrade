@@ -95,7 +95,6 @@ class PaperTrader:
 
         # Cooldown post-SL: (symbol, direction, level_rounded) → timestamp_unix_expiry
         self._loss_cooldown: dict[tuple, float] = {}
-        self._last_scan_event: dict[str, float] = {}
 
         self._cargar_estado()
 
@@ -349,22 +348,6 @@ class PaperTrader:
             df_horario = data[self.tf["hourly"]]
             df_diario = data[self.tf["daily"]]
             df_semanal = data[self.tf["weekly"]]
-
-            # Una muestra cada cinco minutos confirma que el símbolo está vivo sin saturar la DB.
-            now = time.time()
-            if now - self._last_scan_event.get(symbol, 0) >= 300:
-                self._log_event(
-                    symbol=symbol,
-                    strategy="scan",
-                    event_type="SCAN_HEARTBEAT",
-                    price=float(df_entry["close"].iloc[-1]),
-                    details={
-                        "entry_timeframe": self.tf["entry"],
-                        "last_candle": str(df_entry.index[-1]),
-                        "candles": len(df_entry),
-                    },
-                )
-                self._last_scan_event[symbol] = now
 
             # 1. Verificar órdenes abiertas
             self._verificar_ordenes_abiertas(symbol, data)
