@@ -8,6 +8,7 @@ const filterType = ref("");
 let pollTimer = null;
 
 const EVENT_LABELS = {
+  SCAN_HEARTBEAT: { label: "Bot activo", cls: "ev-heartbeat" },
   TRADE_OPENED: { label: "Trade abierto", cls: "ev-trade" },
   REJECTED_CAPACITY: { label: "Sin slot", cls: "ev-capacity" },
   REJECTED_NEWS: { label: "Pausa news", cls: "ev-news" },
@@ -282,6 +283,9 @@ tr.ev-capacity td,
 tr.ev-news td {
   background: rgba(148, 163, 184, 0.05);
 }
+tr.ev-heartbeat td {
+  background: rgba(59, 130, 246, 0.04);
+}
 
 .ts {
   color: var(--text-muted);
@@ -346,5 +350,9 @@ tr.ev-news td {
 .ev-badge.ev-news {
   background: rgba(148, 163, 184, 0.15);
   color: #94a3b8;
+}
+.ev-badge.ev-heartbeat {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
 }
 </style>
