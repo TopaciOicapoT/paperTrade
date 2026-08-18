@@ -76,4 +76,20 @@ jobs:
             $COMPOSE -f docker-compose.prod.yml pull api
             $COMPOSE -f docker-compose.prod.yml up -d --remove-orphans
             docker image prune -f
-            curl --fail --silent --show-error http://127.0.0.1:8000/docs >/dev/null
+            ready=0
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error http://127.0.0.1:8000/docs >/dev/null; then
+                ready=1
+                echo "API ready on attempt $attempt"
+                break
+              fi
+              echo "API not ready yet (attempt $attempt/30); waiting 2s"
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "API failed readiness check; container status:"
+              $COMPOSE -f docker-compose.prod.yml ps
+              echo "API logs:"
+              $COMPOSE -f docker-compose.prod.yml logs --tail=200 api
+              exit 1
+            fi
