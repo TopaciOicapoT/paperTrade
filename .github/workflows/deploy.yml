@@ -39,6 +39,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout deployment files
+        uses: actions/checkout@v4
+
       - name: Copy production files
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -59,7 +62,9 @@ jobs:
           script: |
             set -e
             cd /opt/papertrade
-            docker compose -f docker-compose.prod.yml pull api
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            COMPOSE="docker compose"
+            if command -v docker-compose >/dev/null 2>&1; then COMPOSE="docker-compose"; fi
+            $COMPOSE -f docker-compose.prod.yml pull api
+            $COMPOSE -f docker-compose.prod.yml up -d --remove-orphans
             docker image prune -f
             curl --fail --silent --show-error http://127.0.0.1:8000/docs >/dev/null
